@@ -1,4 +1,5 @@
 use core::fmt;
+use std::borrow::Cow;
 use std::error;
 
 use crate::tokenizer::Token;
@@ -79,17 +80,26 @@ pub enum SumOperator {
 }
 
 impl SumOperator {
-    pub fn evaluate<'v>(self, lhs: Value<'v>, rhs: Value<'v>) -> Result<f64, TypeError<'v>> {
+    pub fn evaluate<'v>(
+        self,
+        lhs: &Value<'v>,
+        rhs: &Value<'v>,
+    ) -> Result<Value<'v>, TypeError<'v>> {
+        if let (Value::String(lhs), Self::Plus, Value::String(rhs)) = (lhs, self, rhs) {
+            let string = lhs.as_ref().to_owned() + rhs.as_ref();
+            return Ok(Value::String(string.into()));
+        }
         let lhs = self.cast(lhs)?;
         let rhs = self.cast(rhs)?;
         Ok(match self {
-            Self::Minus => lhs - rhs,
-            Self::Plus => lhs + rhs,
+            Self::Minus => Value::Number(lhs - rhs),
+            Self::Plus => Value::Number(lhs + rhs),
         })
     }
 
-    fn cast(self, lhs: Value<'_>) -> Result<f64, TypeError<'_>> {
-        lhs.to_float().ok_or(TypeError::Sum(self, lhs))
+    fn cast<'a>(self, lhs: &Value<'a>) -> Result<f64, TypeError<'a>> {
+        lhs.to_float()
+            .ok_or_else(|| TypeError::Sum(self, lhs.clone()))
     }
 }
 
@@ -159,26 +169,26 @@ impl<'t> From<Value<'t>> for Primary<'t> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Value<'t> {
     Number(f64),
-    String(&'t str),
+    String(Cow<'t, str>),
     Boolean(bool),
     Nil,
 }
 
 impl<'v> Value<'v> {
-    const fn to_float(self) -> Option<f64> {
+    const fn to_float(&self) -> Option<f64> {
         match self {
-            Value::Number(number) => Some(number),
-            Value::Boolean(boolean) => Some(if boolean { 1.0 } else { 0.0 }),
+            &Value::Number(number) => Some(number),
+            &Value::Boolean(boolean) => Some(if boolean { 1.0 } else { 0.0 }),
             Value::String(_) | Value::Nil => None,
         }
     }
 
-    const fn to_boolean(self) -> bool {
+    const fn to_boolean(&self) -> bool {
         match self {
-            Value::Boolean(boolean) => boolean,
+            &Value::Boolean(boolean) => boolean,
             Value::Nil => false,
             Value::Number(_) | Value::String(_) => true,
         }
@@ -322,7 +332,7 @@ impl<'t> MatchToken<'t> for Value<'t> {
     fn match_token(token: Token<'t>) -> Option<Self> {
         match token {
             Token::Number(number) => Some(Self::Number(number)),
-            Token::String(string) => Some(Self::String(string)),
+            Token::String(string) => Some(Self::String(string.into())),
             Token::False => Some(Self::Boolean(false)),
             Token::True => Some(Self::Boolean(true)),
             Token::Nil => Some(Self::Nil),

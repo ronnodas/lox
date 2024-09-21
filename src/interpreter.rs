@@ -38,7 +38,7 @@ impl<'t> Visitor<'t> for Interpreter {
         let start = self.visit_factor(start)?;
         more.iter().try_fold(start, |lhs, (op, rhs)| {
             let rhs = self.visit_factor(rhs)?;
-            Ok(Value::Number(op.evaluate(lhs, rhs)?))
+            Ok(op.evaluate(&lhs, &rhs)?)
         })
     }
 
@@ -63,7 +63,7 @@ impl<'t> Visitor<'t> for Interpreter {
 
     fn visit_primary(&mut self, primary: &Primary<'t>) -> Self::Output {
         match primary {
-            &Primary::Literal(value) => Ok(value),
+            Primary::Literal(value) => Ok(value.clone()),
             Primary::Grouping(expression) => self.visit_expression(expression),
         }
     }
