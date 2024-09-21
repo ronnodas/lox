@@ -10,37 +10,21 @@ pub enum Expression<'t> {
     Equality(Equality<'t>),
 }
 
-pub struct Equality<'t> {
-    pub start: Comparison<'t>,
-    pub more: Vec<(EqualityOperator, Comparison<'t>)>,
+// TODO: could make the two operands different types, is that useful anywhere?
+pub struct Fold<T, Op> {
+    pub start: T,
+    pub more: Vec<(Op, T)>,
 }
+
+pub type Equality<'t> = Fold<Comparison<'t>, EqualityOperator>;
+pub type Comparison<'t> = Fold<Sum<'t>, ComparisonOperator>;
+pub type Sum<'t> = Fold<Factor<'t>, SumOperator>;
+pub type Factor<'t> = Fold<Unary<'t>, FactorOperator>;
 
 #[derive(Clone, Copy)]
 pub enum EqualityOperator {
     Equal,
     NotEqual,
-}
-
-#[expect(clippy::float_cmp, reason = "Lox spec is weird")]
-impl EqualityOperator {
-    pub fn evaluate<'t>(self, lhs: Value<'t>, rhs: Value<'t>) -> bool {
-        let equal = match (lhs, rhs) {
-            (Value::Number(lhs), Value::Number(rhs)) => lhs == rhs,
-            (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
-            (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
-            (Value::Nil, Value::Nil) => true,
-            _ => false,
-        };
-        match self {
-            Self::Equal => equal,
-            Self::NotEqual => !equal,
-        }
-    }
-}
-
-pub struct Comparison<'t> {
-    pub start: Sum<'t>,
-    pub more: Vec<(ComparisonOperator, Sum<'t>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,25 +36,9 @@ pub enum ComparisonOperator {
 }
 
 impl ComparisonOperator {
-    pub fn evaluate<'e>(self, lhs: Value<'e>, rhs: Value<'e>) -> Result<bool, TypeError<'e>> {
-        let lhs = self.cast(lhs)?;
-        let rhs = self.cast(rhs)?;
-        Ok(match self {
-            Self::Greater => lhs > rhs,
-            Self::GreaterEqual => lhs >= rhs,
-            Self::Less => lhs < rhs,
-            Self::LessEqual => lhs <= rhs,
-        })
-    }
-
-    fn cast(self, value: Value<'_>) -> Result<f64, TypeError<'_>> {
+    pub fn cast(self, value: Value<'_>) -> Result<f64, TypeError<'_>> {
         value.to_float().ok_or(TypeError::Comparison(self, value))
     }
-}
-
-pub struct Sum<'t> {
-    pub start: Factor<'t>,
-    pub more: Vec<(SumOperator, Factor<'t>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,32 +48,10 @@ pub enum SumOperator {
 }
 
 impl SumOperator {
-    pub fn evaluate<'v>(
-        self,
-        lhs: &Value<'v>,
-        rhs: &Value<'v>,
-    ) -> Result<Value<'v>, TypeError<'v>> {
-        if let (Value::String(lhs), Self::Plus, Value::String(rhs)) = (lhs, self, rhs) {
-            let string = lhs.as_ref().to_owned() + rhs.as_ref();
-            return Ok(Value::String(string.into()));
-        }
-        let lhs = self.cast(lhs)?;
-        let rhs = self.cast(rhs)?;
-        Ok(match self {
-            Self::Minus => Value::Number(lhs - rhs),
-            Self::Plus => Value::Number(lhs + rhs),
-        })
-    }
-
-    fn cast<'a>(self, lhs: &Value<'a>) -> Result<f64, TypeError<'a>> {
+    pub fn cast<'a>(self, lhs: &Value<'a>) -> Result<f64, TypeError<'a>> {
         lhs.to_float()
             .ok_or_else(|| TypeError::Sum(self, lhs.clone()))
     }
-}
-
-pub struct Factor<'t> {
-    pub start: Unary<'t>,
-    pub more: Vec<(FactorOperator, Unary<'t>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,16 +61,7 @@ pub enum FactorOperator {
 }
 
 impl FactorOperator {
-    pub fn evaluate<'v>(self, lhs: Value<'v>, rhs: Value<'v>) -> Result<f64, TypeError<'v>> {
-        let lhs = self.cast(lhs)?;
-        let rhs = self.cast(rhs)?;
-        Ok(match self {
-            Self::Divide => lhs / rhs,
-            Self::Multiply => lhs * rhs,
-        })
-    }
-
-    fn cast(self, lhs: Value<'_>) -> Result<f64, TypeError<'_>> {
+    pub fn cast(self, lhs: Value<'_>) -> Result<f64, TypeError<'_>> {
         lhs.to_float().ok_or(TypeError::Factor(self, lhs))
     }
 }
@@ -175,6 +112,18 @@ pub enum Value<'t> {
     String(Cow<'t, str>),
     Boolean(bool),
     Nil,
+}
+
+impl<'t> From<f64> for Value<'t> {
+    fn from(v: f64) -> Self {
+        Self::Number(v)
+    }
+}
+
+impl<'t> From<bool> for Value<'t> {
+    fn from(v: bool) -> Self {
+        Self::Boolean(v)
+    }
 }
 
 impl<'v> Value<'v> {
@@ -414,14 +363,73 @@ impl<'t> Parse<'t> for Primary<'t> {
 
 pub trait Visitor<'t> {
     type Output;
+    type Error;
 
-    fn visit_expression(&mut self, expression: &Expression<'t>) -> Self::Output;
-    fn visit_equality(&mut self, equality: &Equality<'t>) -> Self::Output;
-    fn visit_comparison(&mut self, comparison: &Comparison<'t>) -> Self::Output;
-    fn visit_sum(&mut self, sum: &Sum<'t>) -> Self::Output;
-    fn visit_factor(&mut self, factor: &Factor<'t>) -> Self::Output;
-    fn visit_unary(&mut self, unary: &Unary<'t>) -> Self::Output;
-    fn visit_primary(&mut self, primary: &Primary<'t>) -> Self::Output;
+    fn visit_expression(
+        &mut self,
+        expression: &Expression<'t>,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_comparison(
+        &mut self,
+        comparison: &Comparison<'t>,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_sum(&mut self, sum: &Sum<'t>) -> Result<Self::Output, Self::Error>;
+    fn visit_factor(&mut self, factor: &Factor<'t>) -> Result<Self::Output, Self::Error>;
+    fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error>;
+    fn visit_primary(&mut self, primary: &Primary<'t>) -> Result<Self::Output, Self::Error>;
+    fn visit_equality(&mut self, equality: &Equality<'t>) -> Result<Self::Output, Self::Error>;
+
+    fn visit_fold<T, Op>(&mut self, fold: &Fold<T, Op>) -> Result<Self::Output, Self::Error>
+    where
+        Self: Sized,
+        T: Host<'t, Self>,
+        Op: BinaryOperator<Self::Output, Output: Into<Self::Output>, Error: Into<Self::Error>>
+            + Copy,
+    {
+        fold.host(self)
+    }
+}
+
+pub trait BinaryOperator<I> {
+    type Output;
+    type Error;
+
+    fn evaluate(self, lhs: I, rhs: I) -> Result<Self::Output, Self::Error>;
+}
+
+pub trait Host<'t, V: Visitor<'t>> {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
+}
+
+impl<'t, V: Visitor<'t>> Host<'t, V> for Expression<'t> {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        visitor.visit_expression(self)
+    }
+}
+
+impl<'t, V: Visitor<'t>> Host<'t, V> for Unary<'t> {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        visitor.visit_unary(self)
+    }
+}
+
+impl<'t, V, T, Op> Host<'t, V> for Fold<T, Op>
+where
+    V: Visitor<'t>,
+    T: Host<'t, V>,
+    Op: BinaryOperator<V::Output, Output: Into<V::Output>, Error: Into<V::Error>> + Copy,
+{
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        let Self { start, more } = self;
+        let start = start.host(visitor)?;
+        more.iter().try_fold(start, |lhs, (op, rhs)| {
+            let rhs = rhs.host(visitor)?;
+            match op.evaluate(lhs, rhs) {
+                Ok(output) => Ok(output.into()),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
 }
 
 impl fmt::Display for Value<'_> {

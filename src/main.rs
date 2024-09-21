@@ -59,7 +59,13 @@ fn run_prompt(interpreter: &mut Interpreter) -> anyhow::Result<()> {
 
 fn run(interpreter: &mut Interpreter, source: &str) -> anyhow::Result<()> {
     let tokenizer = Tokenizer::new(source);
-    let tokens = tokenizer.into_tokens().context("Lexing error")?;
+    let tokens = match tokenizer.into_tokens() {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            println!("Lexing error: {e}");
+            return Ok(());
+        }
+    };
     let mut parser = Parser::new(&tokens);
     let expression = parser
         .expression()

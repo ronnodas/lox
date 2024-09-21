@@ -1,57 +1,46 @@
+use std::convert::Infallible;
 use std::{error, fmt};
 
 use crate::parser::ast::{
-    Comparison, Equality, Expression, Factor, Primary, Sum, TypeError, Unary, Value, Visitor,
+    BinaryOperator, Comparison, ComparisonOperator, Equality, EqualityOperator, Expression, Factor,
+    FactorOperator, Primary, Sum, SumOperator, TypeError, Unary, Value, Visitor,
 };
 
 pub struct Interpreter;
 
 impl<'t> Visitor<'t> for Interpreter {
-    type Output = Result<Value<'t>, Error<'t>>;
+    type Output = Value<'t>;
+    type Error = Error<'t>;
 
-    fn visit_expression(&mut self, expression: &Expression<'t>) -> Self::Output {
+    fn visit_expression(
+        &mut self,
+        expression: &Expression<'t>,
+    ) -> Result<Self::Output, Self::Error> {
         match expression {
             Expression::Equality(equality) => self.visit_equality(equality),
         }
     }
 
-    fn visit_equality(&mut self, equality: &Equality<'t>) -> Self::Output {
-        let Equality { start, more } = equality;
-        let start = self.visit_comparison(start)?;
-        more.iter().try_fold(start, |lhs, (op, rhs)| {
-            let rhs = self.visit_comparison(rhs)?;
-            Ok(Value::Boolean(op.evaluate(lhs, rhs)))
-        })
+    fn visit_equality(&mut self, equality: &Equality<'t>) -> Result<Self::Output, Self::Error> {
+        self.visit_fold(equality)
     }
 
-    fn visit_comparison(&mut self, comparison: &Comparison<'t>) -> Self::Output {
-        let Comparison { start, more } = comparison;
-        let start = self.visit_sum(start)?;
-        more.iter().try_fold(start, |lhs, (op, rhs)| {
-            let rhs = self.visit_sum(rhs)?;
-            Ok(Value::Boolean(op.evaluate(lhs, rhs)?))
-        })
+    fn visit_comparison(
+        &mut self,
+        comparison: &Comparison<'t>,
+    ) -> Result<Self::Output, Self::Error> {
+        self.visit_fold(comparison)
     }
 
-    fn visit_sum(&mut self, sum: &Sum<'t>) -> Self::Output {
-        let Sum { start, more } = sum;
-        let start = self.visit_factor(start)?;
-        more.iter().try_fold(start, |lhs, (op, rhs)| {
-            let rhs = self.visit_factor(rhs)?;
-            Ok(op.evaluate(&lhs, &rhs)?)
-        })
+    fn visit_sum(&mut self, sum: &Sum<'t>) -> Result<Self::Output, Self::Error> {
+        self.visit_fold(sum)
     }
 
-    fn visit_factor(&mut self, factor: &Factor<'t>) -> Self::Output {
-        let Factor { start, more } = factor;
-        let start = self.visit_unary(start)?;
-        more.iter().try_fold(start, |lhs, (op, rhs)| {
-            let rhs = self.visit_unary(rhs)?;
-            Ok(Value::Number(op.evaluate(lhs, rhs)?))
-        })
+    fn visit_factor(&mut self, factor: &Factor<'t>) -> Result<Self::Output, Self::Error> {
+        self.visit_fold(factor)
     }
 
-    fn visit_unary(&mut self, unary: &Unary<'t>) -> Self::Output {
+    fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error> {
         match unary {
             Unary::Unary(op, unary) => {
                 let unary = self.visit_unary(unary)?;
@@ -61,7 +50,7 @@ impl<'t> Visitor<'t> for Interpreter {
         }
     }
 
-    fn visit_primary(&mut self, primary: &Primary<'t>) -> Self::Output {
+    fn visit_primary(&mut self, primary: &Primary<'t>) -> Result<Self::Output, Self::Error> {
         match primary {
             Primary::Literal(value) => Ok(value.clone()),
             Primary::Grouping(expression) => self.visit_expression(expression),
@@ -81,6 +70,12 @@ pub enum Error<'e> {
     Type(TypeError<'e>),
 }
 
+impl<'e> From<Infallible> for Error<'e> {
+    fn from(infallible: Infallible) -> Self {
+        match infallible {}
+    }
+}
+
 impl<'e> From<TypeError<'e>> for Error<'e> {
     fn from(v: TypeError<'e>) -> Self {
         Self::Type(v)
@@ -96,3 +91,71 @@ impl fmt::Display for Error<'_> {
 }
 
 impl error::Error for Error<'_> {}
+
+impl<'t> BinaryOperator<Value<'t>> for EqualityOperator {
+    type Output = bool;
+    type Error = Infallible;
+
+    #[expect(clippy::float_cmp, reason = "Lox spec is weird")]
+    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<bool, Self::Error> {
+        let equal = match (lhs, rhs) {
+            (Value::Number(lhs), Value::Number(rhs)) => lhs == rhs,
+            (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
+            (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
+            (Value::Nil, Value::Nil) => true,
+            _ => false,
+        };
+        match self {
+            Self::Equal => Ok(equal),
+            Self::NotEqual => Ok(!equal),
+        }
+    }
+}
+
+impl<'t> BinaryOperator<Value<'t>> for ComparisonOperator {
+    type Output = bool;
+    type Error = TypeError<'t>;
+
+    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<bool, Self::Error> {
+        let lhs = self.cast(lhs)?;
+        let rhs = self.cast(rhs)?;
+        Ok(match self {
+            Self::Greater => lhs > rhs,
+            Self::GreaterEqual => lhs >= rhs,
+            Self::Less => lhs < rhs,
+            Self::LessEqual => lhs <= rhs,
+        })
+    }
+}
+
+impl<'t> BinaryOperator<Value<'t>> for SumOperator {
+    type Output = Value<'t>;
+    type Error = TypeError<'t>;
+
+    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<Self::Output, Self::Error> {
+        if let (Value::String(lhs), Self::Plus, Value::String(rhs)) = (&lhs, self, &rhs) {
+            let string = lhs.as_ref().to_owned() + rhs.as_ref();
+            return Ok(Value::String(string.into()));
+        }
+        let lhs = self.cast(&lhs)?;
+        let rhs = self.cast(&rhs)?;
+        Ok(match self {
+            Self::Minus => Value::Number(lhs - rhs),
+            Self::Plus => Value::Number(lhs + rhs),
+        })
+    }
+}
+
+impl<'t> BinaryOperator<Value<'t>> for FactorOperator {
+    type Output = f64;
+    type Error = TypeError<'t>;
+
+    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<f64, Self::Error> {
+        let lhs = self.cast(lhs)?;
+        let rhs = self.cast(rhs)?;
+        Ok(match self {
+            Self::Divide => lhs / rhs,
+            Self::Multiply => lhs * rhs,
+        })
+    }
+}
