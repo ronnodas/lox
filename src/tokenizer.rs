@@ -24,9 +24,9 @@ impl<'a> Tokenizer<'a> {
     // TODO Add support for C-style /* ... */ block comments.
     // Make sure to handle newlines in them. Consider allowing them to nest.
     fn scan_token(&mut self) -> Option<Result<SourceToken<'a>, Error>> {
-        let backtrack = self.source;
         let token_type = loop {
             let (c, rest) = split_first_char(self.source)?;
+            let backtrack = self.source;
             self.source = rest;
             break match c {
                 '(' => Token::LeftParen,
@@ -136,6 +136,7 @@ impl<'a> Tokenizer<'a> {
                 true
             }
         });
+
         let (number, rest) = match mid {
             Some(mid) => {
                 let (number, rest) = self.source.split_at(mid);
@@ -192,7 +193,7 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Token<'a> {
     // Single-character tokens.
     LeftParen,
@@ -242,6 +243,7 @@ pub enum Token<'a> {
 
     Eof,
 }
+
 impl<'a> Token<'a> {
     pub fn keyword(identifier: &str) -> Option<Self> {
         let keyword = match identifier {
@@ -268,14 +270,47 @@ impl<'a> Token<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceToken<'a> {
-    token_type: Token<'a>,
-    line: usize,
+    pub token: Token<'a>,
+    pub line: usize,
 }
 
 impl<'a> SourceToken<'a> {
-    pub const fn new(token_type: Token<'a>, line: usize) -> Self {
-        Self { token_type, line }
+    pub const fn new(token: Token<'a>, line: usize) -> Self {
+        Self { token, line }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenizer() {
+        let source = "2 < 3";
+
+        let tokenizer = Tokenizer::new(source);
+        assert_eq!(
+            &tokenizer.into_tokens().unwrap(),
+            &[
+                SourceToken {
+                    token: Token::Number(2.0),
+                    line: 1
+                },
+                SourceToken {
+                    token: Token::Less,
+                    line: 1
+                },
+                SourceToken {
+                    token: Token::Number(3.0),
+                    line: 1
+                },
+                SourceToken {
+                    token: Token::Eof,
+                    line: 1
+                }
+            ]
+        );
     }
 }
