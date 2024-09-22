@@ -1,5 +1,8 @@
+use std::iter::from_fn;
 use std::num::ParseFloatError;
 use std::{error, fmt};
+
+use itertools::Itertools as _;
 
 pub struct Tokenizer<'a> {
     source: &'a str,
@@ -12,11 +15,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     pub fn into_tokens(mut self) -> Result<Vec<SourceToken<'a>>, Error> {
-        let mut tokens = Vec::new();
-        while let Some(token) = self.scan_token() {
-            tokens.push(token?);
-        }
-
+        let mut tokens: Vec<_> = from_fn(|| self.scan_token()).try_collect()?;
         tokens.push(SourceToken::new(Token::Eof, self.line));
         Ok(tokens)
     }
@@ -47,15 +46,7 @@ impl<'a> Tokenizer<'a> {
 
                 '/' => {
                     if self.try_read('/') {
-                        match self.split_once('\n') {
-                            Some(_comment) => {
-                                self.line += 1;
-                            }
-                            None => {
-                                // comment terminated by eof
-                                self.source = "";
-                            }
-                        }
+                        self.discard_comment();
                         continue;
                     }
                     Token::Slash
@@ -91,6 +82,13 @@ impl<'a> Tokenizer<'a> {
             };
         };
         Some(Ok(SourceToken::new(token_type, self.line)))
+    }
+
+    fn discard_comment(&mut self) {
+        match self.split_once('\n') {
+            Some(_comment) => self.line += 1,
+            None => self.source = "", // comment terminated by eof
+        }
     }
 
     fn if_next_equal(&mut self, yes: Token<'a>, no: Token<'a>) -> Token<'a> {

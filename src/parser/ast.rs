@@ -4,8 +4,6 @@ use std::error;
 
 use crate::tokenizer::Token;
 
-use super::{Error as ParseError, Parser};
-
 pub enum Expression<'t> {
     Equality(Equality<'t>),
 }
@@ -295,77 +293,6 @@ impl<'t> MatchToken<'t> for Value<'t> {
     }
 }
 
-pub trait Parse<'t>: Sized {
-    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, ParseError<'t>>;
-}
-
-pub trait ParseTower<'t>: Sized {
-    type Term: Parse<'t>;
-    type Operator: MatchToken<'t>;
-
-    fn new(start: Self::Term, more: Vec<(Self::Operator, Self::Term)>) -> Self;
-}
-
-impl<'t> ParseTower<'t> for Equality<'t> {
-    type Term = Comparison<'t>;
-    type Operator = EqualityOperator;
-
-    fn new(start: Comparison<'t>, more: Vec<(EqualityOperator, Comparison<'t>)>) -> Self {
-        Self { start, more }
-    }
-}
-
-impl<'t> ParseTower<'t> for Comparison<'t> {
-    type Term = Sum<'t>;
-    type Operator = ComparisonOperator;
-
-    fn new(start: Sum<'t>, more: Vec<(ComparisonOperator, Sum<'t>)>) -> Self {
-        Self { start, more }
-    }
-}
-
-impl<'t> ParseTower<'t> for Sum<'t> {
-    type Term = Factor<'t>;
-    type Operator = SumOperator;
-
-    fn new(start: Factor<'t>, more: Vec<(SumOperator, Factor<'t>)>) -> Self {
-        Self { start, more }
-    }
-}
-
-impl<'t> ParseTower<'t> for Factor<'t> {
-    type Term = Unary<'t>;
-    type Operator = FactorOperator;
-
-    fn new(start: Unary<'t>, more: Vec<(FactorOperator, Unary<'t>)>) -> Self {
-        Self { start, more }
-    }
-}
-
-impl<'t, T: ParseTower<'t>> Parse<'t> for T {
-    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, ParseError<'t>> {
-        parser.parse_fold()
-    }
-}
-
-impl<'t> Parse<'t> for Expression<'t> {
-    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, ParseError<'t>> {
-        parser.expression()
-    }
-}
-
-impl<'t> Parse<'t> for Unary<'t> {
-    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, ParseError<'t>> {
-        parser.unary()
-    }
-}
-
-impl<'t> Parse<'t> for Primary<'t> {
-    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, ParseError<'t>> {
-        parser.literal()
-    }
-}
-
 pub trait ExpressionVisitor<'t> {
     type Output;
     type Error;
@@ -376,17 +303,6 @@ pub trait ExpressionVisitor<'t> {
     ) -> Result<Self::Output, Self::Error>;
     fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error>;
     fn visit_primary(&mut self, primary: &Primary<'t>) -> Result<Self::Output, Self::Error>;
-    fn visit_equality(&mut self, equality: &Equality<'t>) -> Result<Self::Output, Self::Error>;
-
-    fn visit_fold<T, Op>(&mut self, fold: &Fold<T, Op>) -> Result<Self::Output, Self::Error>
-    where
-        Self: Sized,
-        T: ExpressionHost<'t, Self>,
-        Op: BinaryOperator<Self::Output, Output: Into<Self::Output>, Error: Into<Self::Error>>
-            + Copy,
-    {
-        fold.host(self)
-    }
 }
 
 pub trait StatementVisitor<'t> {
@@ -452,10 +368,9 @@ where
         let start = start.host(visitor)?;
         more.iter().try_fold(start, |lhs, (op, rhs)| {
             let rhs = rhs.host(visitor)?;
-            match op.evaluate(lhs, rhs) {
-                Ok(output) => Ok(output.into()),
-                Err(error) => Err(error.into()),
-            }
+            op.evaluate(lhs, rhs)
+                .map(Op::Output::into)
+                .map_err(Op::Error::into)
         })
     }
 }

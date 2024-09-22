@@ -1,8 +1,9 @@
 pub mod ast;
 
+use std::iter::from_fn;
 use std::{error, fmt};
 
-use ast::{Equality, Expression, MatchToken, Parse, ParseTower, Primary, Statement, Unary, Value};
+use ast::{Equality, Expression, Fold, MatchToken, Primary, Statement, Unary, Value};
 
 use crate::tokenizer::{SourceToken, Token};
 
@@ -10,29 +11,30 @@ pub struct Parser<'p, 't> {
     tokens: &'p [SourceToken<'t>],
 }
 
-impl<'p, 't> Parser<'p, 't> {
+impl<'t, 'p> Parser<'p, 't> {
     pub const fn new(tokens: &'p [SourceToken<'t>]) -> Self {
         Self { tokens }
     }
 
-    pub fn into_parsed(mut self) -> Result<Vec<Statement<'t>>, Error<'t>> {
-        let mut statements = Vec::new();
-        while let Some(statement) = self.statement()? {
-            statements.push(statement);
-        }
-        Ok(statements)
+    pub fn into_statements(
+        mut self,
+    ) -> impl Iterator<Item = Result<Statement<'t>, Error<'t>>> + 'p {
+        from_fn(move || {
+            let statement = self.parse().transpose()?;
+            if statement.is_err() {
+                self.recover();
+            }
+            Some(statement)
+        })
     }
 
-    fn statement(&mut self) -> Result<Option<Statement<'t>>, Error<'t>> {
-        self.print_statement()?.map_or_else(
-            || self.expression_statement(),
-            |statement| Ok(Some(statement)),
-        )
+    fn parse<T: Parse<'t>>(&mut self) -> Result<Option<T>, Error<'t>> {
+        T::parse(self)
     }
 
     fn print_statement(&mut self) -> Result<Option<Statement<'t>>, Error<'t>> {
         if let Ok(&SourceToken { line, .. }) = self.consume(&Token::Print) {
-            let Some(expression) = self.expression()? else {
+            let Some(expression) = self.parse()? else {
                 return Err(self.unexpected());
             };
 
@@ -47,7 +49,7 @@ impl<'p, 't> Parser<'p, 't> {
     }
 
     fn expression_statement(&mut self) -> Result<Option<Statement<'t>>, Error<'t>> {
-        let Some(expression) = self.expression()? else {
+        let Some(expression) = self.parse()? else {
             return Ok(None);
         };
 
@@ -56,28 +58,6 @@ impl<'p, 't> Parser<'p, 't> {
         } else {
             Err(self.unexpected())
         }
-    }
-
-    pub fn expression(&mut self) -> Result<Option<Expression<'t>>, Error<'t>> {
-        self.parse::<Equality>().map(|e| e.map(Expression::from))
-    }
-
-    fn parse<T: Parse<'t>>(&mut self) -> Result<Option<T>, Error<'t>> {
-        T::parse(self)
-    }
-
-    fn parse_fold<T: ParseTower<'t>>(&mut self) -> Result<Option<T>, Error<'t>> {
-        let Some(start) = self.parse()? else {
-            return Ok(None);
-        };
-        let mut more = Vec::new();
-        while let Some(operator) = self.try_read_any() {
-            let Some(right) = self.parse()? else {
-                return Err(self.unexpected());
-            };
-            more.push((operator, right));
-        }
-        Ok(Some(T::new(start, more)))
     }
 
     const fn unexpected(&self) -> Error<'t> {
@@ -110,8 +90,69 @@ impl<'p, 't> Parser<'p, 't> {
         }
     }
 
-    fn literal(&mut self) -> Result<Option<Primary<'t>>, Error<'t>> {
-        if let Some(primary) = self.try_read_any::<Value<'t>>() {
+    fn recover(&mut self) {
+        let mid = if let Some(mid) = self.tokens.iter().position(|t| t.token == Token::Semicolon) {
+            mid
+        } else {
+            self.tokens.len()
+        };
+        self.tokens = &self.tokens[mid..];
+    }
+}
+
+pub trait Parse<'t>: Sized {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>>;
+}
+
+//TODO maybe inline and restructure once all the different statements are implemented
+impl<'t> Parse<'t> for Statement<'t> {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
+        if let statement @ Some(_) = parser.print_statement()? {
+            return Ok(statement);
+        }
+        parser.expression_statement()
+    }
+}
+
+impl<'t> Parse<'t> for Expression<'t> {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
+        parser.parse::<Equality>().map(|e| e.map(Self::from))
+    }
+}
+
+impl<'t, T: Parse<'t>, Op: MatchToken<'t>> Parse<'t> for Fold<T, Op> {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
+        let this = &mut *parser;
+        let Some(start) = this.parse()? else {
+            return Ok(None);
+        };
+        let mut more = Vec::new();
+        while let Some(operator) = this.try_read_any() {
+            let Some(right) = this.parse()? else {
+                return Err(this.unexpected());
+            };
+            more.push((operator, right));
+        }
+        Ok(Some(Self { start, more }))
+    }
+}
+
+impl<'t> Parse<'t> for Unary<'t> {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
+        if let Some(operator) = parser.try_read_any() {
+            let Some(right) = parser.parse()? else {
+                return Err(parser.unexpected());
+            };
+            Ok(Some(Self::Unary(operator, Box::new(right))))
+        } else {
+            parser.parse::<Primary<'t>>().map(|e| e.map(Self::from))
+        }
+    }
+}
+
+impl<'t> Parse<'t> for Primary<'t> {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
+        if let Some(primary) = parser.try_read_any::<Value<'t>>() {
             return Ok(Some(primary.into()));
         }
         let Some((
@@ -120,19 +161,19 @@ impl<'p, 't> Parser<'p, 't> {
                 token: Token::LeftParen,
             },
             rest,
-        )) = self.tokens.split_first()
+        )) = parser.tokens.split_first()
         else {
             return Ok(None);
         };
-        self.tokens = rest;
-        let Some(expression) = self.parse()? else {
-            let error = match self.tokens.first() {
+        parser.tokens = rest;
+        let Some(expression) = parser.parse()? else {
+            let error = match parser.tokens.first() {
                 Some(&token) => Error::UnexpectedToken(token),
                 None => Error::UnmatchedParen(line),
             };
             return Err(error);
         };
-        match self.tokens.split_first() {
+        match parser.tokens.split_first() {
             None => Err(Error::UnmatchedParen(line)),
             Some((
                 SourceToken {
@@ -141,21 +182,10 @@ impl<'p, 't> Parser<'p, 't> {
                 },
                 rest,
             )) => {
-                self.tokens = rest;
+                parser.tokens = rest;
                 Ok(Some(Primary::group(expression)))
             }
             Some((&token, _)) => Err(Error::UnexpectedToken(token)),
-        }
-    }
-
-    fn unary(&mut self) -> Result<Option<Unary<'t>>, Error<'t>> {
-        if let Some(operator) = self.try_read_any() {
-            let Some(right) = self.parse()? else {
-                return Err(self.unexpected());
-            };
-            Ok(Some(Unary::Unary(operator, Box::new(right))))
-        } else {
-            self.parse::<Primary<'t>>().map(|e| e.map(Unary::from))
         }
     }
 }

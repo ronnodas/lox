@@ -4,9 +4,9 @@ use std::{error, fmt, io};
 use anyhow::Context as _;
 
 use crate::parser::ast::{
-    BinaryOperator, ComparisonOperator, Equality, EqualityOperator, Expression, ExpressionVisitor,
-    FactorOperator, Primary, Statement, StatementHost as _, StatementVisitor, SumOperator,
-    TypeError, Unary, Value,
+    BinaryOperator, ComparisonOperator, EqualityOperator, Expression, ExpressionHost,
+    ExpressionVisitor, FactorOperator, Primary, Statement, StatementHost as _, StatementVisitor,
+    SumOperator, TypeError, Unary, Value,
 };
 use crate::parser::Parser;
 use crate::tokenizer::Tokenizer;
@@ -40,12 +40,8 @@ impl<'t> ExpressionVisitor<'t> for Interpreter {
         expression: &Expression<'t>,
     ) -> Result<Self::Output, Self::Error> {
         match expression {
-            Expression::Equality(equality) => self.visit_equality(equality),
+            Expression::Equality(equality) => equality.host(self),
         }
-    }
-
-    fn visit_equality(&mut self, equality: &Equality<'t>) -> Result<Self::Output, Self::Error> {
-        self.visit_fold(equality)
     }
 
     fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error> {
@@ -69,7 +65,7 @@ impl<'t> ExpressionVisitor<'t> for Interpreter {
 impl Interpreter {
     pub fn interpret<'s, 'i: 's>(
         &'i mut self,
-        statements: Vec<Statement<'s>>,
+        statements: impl IntoIterator<Item = Statement<'s>> + 's,
     ) -> impl Iterator<Item = Result<String, Error<'s>>> + 's {
         statements
             .into_iter()
@@ -81,31 +77,22 @@ impl Interpreter {
         &'i mut self,
         source: &'s str,
     ) -> Option<impl Iterator<Item = String> + 's> {
-        let tokenizer = Tokenizer::new(source);
-        let tokens = match tokenizer.into_tokens() {
-            Ok(tokens) => tokens,
-            Err(e) => {
-                eprintln!("Lexing error: {e}");
-                return None;
-            }
-        };
-        let parser = Parser::new(&tokens);
-        let statements = match parser.into_parsed() {
-            Ok(statements) => statements,
-            Err(e) => {
-                eprintln!("Parsing error: {e}");
-                return None;
-            }
-        };
+        let tokens = Tokenizer::new(source)
+            .into_tokens()
+            .inspect_err(|e| eprintln!("Lexing error: {e}"))
+            .ok()?;
+        let statements: Vec<_> = Parser::new(&tokens)
+            .into_statements()
+            .filter_map(|statement| {
+                statement
+                    .inspect_err(|e| eprintln!("Parsing error: {e}"))
+                    .ok()
+            })
+            .collect();
 
         Some(
             self.interpret(statements)
-                .inspect(|output| {
-                    if let Err(e) = output {
-                        eprintln!("Runtime error: {e}");
-                    }
-                })
-                .filter_map(Result::ok),
+                .filter_map(|output| output.inspect_err(|e| eprintln!("Runtime error: {e}")).ok()),
         )
     }
 
