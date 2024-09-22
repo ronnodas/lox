@@ -2,16 +2,13 @@ mod interpreter;
 mod parser;
 mod tokenizer;
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::{error, fmt, fs, io};
+use std::{fs, io};
 
 use anyhow::Context as _;
 use clap::Parser as ArgParser;
 
 use interpreter::Interpreter;
-use parser::Parser;
-use tokenizer::Tokenizer;
 
 #[derive(ArgParser, Debug)]
 #[command(version)]
@@ -23,76 +20,24 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut interpreter = Interpreter;
     if let Some(script_path) = &args.script_path {
-        run_file(&mut interpreter, script_path)?;
+        let script = fs::read_to_string(script_path).context("Failed to read file")?;
+        interpreter.run_and_print(&script);
     } else {
-        run_prompt(&mut interpreter)?;
+        interpreter.run_with_prompt(io::stdout(), io::stdin().lines())?;
     }
     Ok(())
 }
 
-fn run_file(interpreter: &mut Interpreter, path: &PathBuf) -> anyhow::Result<()> {
-    let script = fs::read_to_string(path).context("Failed to read file")?;
-    run(interpreter, &script)?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "https://github.com/rust-lang/rust-clippy/issues/12121"
-)]
-fn run_prompt(interpreter: &mut Interpreter) -> anyhow::Result<()> {
-    let mut input = io::stdin().lines();
-    let mut stdout = io::stdout();
+    #[test]
+    fn test_8_1() {
+        let mut interpreter = Interpreter;
+        let source = "print \"one\";\nprint true;\nprint 2 + 1;";
+        let output = interpreter.collect_output(source).unwrap();
 
-    loop {
-        stdout.write_all(b"> ")?;
-        stdout.flush()?;
-        let Some(line) = input.next() else {
-            break;
-        };
-        let line = line.context("Failed to read from stdin")?;
-
-        run(interpreter, &line)?;
-    }
-    Ok(())
-}
-
-fn run(interpreter: &mut Interpreter, source: &str) -> anyhow::Result<()> {
-    let tokenizer = Tokenizer::new(source);
-    let tokens = match tokenizer.into_tokens() {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            println!("Lexing error: {e}");
-            return Ok(());
-        }
-    };
-    let mut parser = Parser::new(&tokens);
-    let expression = parser
-        .expression()
-        .map_err(|e| StringError(e.to_string()))
-        .context("Parsing error")?
-        .context("No expression")?;
-
-    match interpreter.interpret(&expression) {
-        Ok(()) => (),
-        Err(e) => println!("Runtime error: {e}"),
-    };
-
-    Ok(())
-}
-
-struct StringError(String);
-
-impl fmt::Display for StringError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        assert_eq!(output, vec!["\"one\"", "true", "3"]);
     }
 }
-
-impl fmt::Debug for StringError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.0)
-    }
-}
-
-impl error::Error for StringError {}

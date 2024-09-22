@@ -1,14 +1,37 @@
 use std::convert::Infallible;
-use std::{error, fmt};
+use std::{error, fmt, io};
+
+use anyhow::Context as _;
 
 use crate::parser::ast::{
-    BinaryOperator, Comparison, ComparisonOperator, Equality, EqualityOperator, Expression, Factor,
-    FactorOperator, Primary, Sum, SumOperator, TypeError, Unary, Value, Visitor,
+    BinaryOperator, ComparisonOperator, Equality, EqualityOperator, Expression, ExpressionVisitor,
+    FactorOperator, Primary, Statement, StatementHost as _, StatementVisitor, SumOperator,
+    TypeError, Unary, Value,
 };
+use crate::parser::Parser;
+use crate::tokenizer::Tokenizer;
 
 pub struct Interpreter;
 
-impl<'t> Visitor<'t> for Interpreter {
+impl<'t> StatementVisitor<'t> for Interpreter {
+    type Output = Option<String>;
+    type Error = Error<'t>;
+
+    fn visit_print(&mut self, print: &Expression<'t>) -> Result<Self::Output, Self::Error> {
+        let value = self.visit_expression(print)?;
+        Ok(Some(format!("{value}")))
+    }
+
+    fn visit_expression_statement(
+        &mut self,
+        expression: &Expression<'t>,
+    ) -> Result<Self::Output, Self::Error> {
+        _ = self.visit_expression(expression)?;
+        Ok(None)
+    }
+}
+
+impl<'t> ExpressionVisitor<'t> for Interpreter {
     type Output = Value<'t>;
     type Error = Error<'t>;
 
@@ -23,21 +46,6 @@ impl<'t> Visitor<'t> for Interpreter {
 
     fn visit_equality(&mut self, equality: &Equality<'t>) -> Result<Self::Output, Self::Error> {
         self.visit_fold(equality)
-    }
-
-    fn visit_comparison(
-        &mut self,
-        comparison: &Comparison<'t>,
-    ) -> Result<Self::Output, Self::Error> {
-        self.visit_fold(comparison)
-    }
-
-    fn visit_sum(&mut self, sum: &Sum<'t>) -> Result<Self::Output, Self::Error> {
-        self.visit_fold(sum)
-    }
-
-    fn visit_factor(&mut self, factor: &Factor<'t>) -> Result<Self::Output, Self::Error> {
-        self.visit_fold(factor)
     }
 
     fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error> {
@@ -59,9 +67,78 @@ impl<'t> Visitor<'t> for Interpreter {
 }
 
 impl Interpreter {
-    pub fn interpret<'e>(&mut self, expression: &Expression<'e>) -> Result<(), Error<'e>> {
-        println!("{}", self.visit_expression(expression)?);
+    pub fn interpret<'s, 'i: 's>(
+        &'i mut self,
+        statements: Vec<Statement<'s>>,
+    ) -> impl Iterator<Item = Result<String, Error<'s>>> + 's {
+        statements
+            .into_iter()
+            .filter_map(|statement| statement.host(self).transpose())
+    }
+
+    #[must_use]
+    pub fn run<'s, 'i: 's>(
+        &'i mut self,
+        source: &'s str,
+    ) -> Option<impl Iterator<Item = String> + 's> {
+        let tokenizer = Tokenizer::new(source);
+        let tokens = match tokenizer.into_tokens() {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                eprintln!("Lexing error: {e}");
+                return None;
+            }
+        };
+        let parser = Parser::new(&tokens);
+        let statements = match parser.into_parsed() {
+            Ok(statements) => statements,
+            Err(e) => {
+                eprintln!("Parsing error: {e}");
+                return None;
+            }
+        };
+
+        Some(
+            self.interpret(statements)
+                .inspect(|output| {
+                    if let Err(e) = output {
+                        eprintln!("Runtime error: {e}");
+                    }
+                })
+                .filter_map(Result::ok),
+        )
+    }
+
+    pub fn run_and_print(&mut self, line: &str) {
+        for output in self.run(line).into_iter().flatten() {
+            println!("{output}");
+        }
+    }
+
+    pub fn run_with_prompt(
+        &mut self,
+        mut output: impl io::Write,
+        mut input: impl Iterator<Item = Result<String, impl error::Error + Send + Sync + 'static>>,
+    ) -> anyhow::Result<()> {
+        loop {
+            output.write_all(b"> ")?;
+            output.flush()?;
+            let Some(line) = input.next() else {
+                break;
+            };
+            let line = line.context("Failed to read line from input")?;
+
+            for print in self.run(&line).into_iter().flatten() {
+                output.write_all(print.as_bytes())?;
+            }
+            output.flush()?;
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn collect_output(&mut self, source: &str) -> Option<Vec<String>> {
+        self.run(source).map(Vec::from_iter)
     }
 }
 

@@ -10,6 +10,11 @@ pub enum Expression<'t> {
     Equality(Equality<'t>),
 }
 
+pub enum Statement<'t> {
+    Expression(Expression<'t>),
+    Print(Expression<'t>),
+}
+
 // TODO: could make the two operands different types, is that useful anywhere?
 pub struct Fold<T, Op> {
     pub start: T,
@@ -339,7 +344,7 @@ impl<'t> ParseTower<'t> for Factor<'t> {
 
 impl<'t, T: ParseTower<'t>> Parse<'t> for T {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, ParseError<'t>> {
-        parser.parse_tower()
+        parser.parse_fold()
     }
 }
 
@@ -361,7 +366,7 @@ impl<'t> Parse<'t> for Primary<'t> {
     }
 }
 
-pub trait Visitor<'t> {
+pub trait ExpressionVisitor<'t> {
     type Output;
     type Error;
 
@@ -369,12 +374,6 @@ pub trait Visitor<'t> {
         &mut self,
         expression: &Expression<'t>,
     ) -> Result<Self::Output, Self::Error>;
-    fn visit_comparison(
-        &mut self,
-        comparison: &Comparison<'t>,
-    ) -> Result<Self::Output, Self::Error>;
-    fn visit_sum(&mut self, sum: &Sum<'t>) -> Result<Self::Output, Self::Error>;
-    fn visit_factor(&mut self, factor: &Factor<'t>) -> Result<Self::Output, Self::Error>;
     fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error>;
     fn visit_primary(&mut self, primary: &Primary<'t>) -> Result<Self::Output, Self::Error>;
     fn visit_equality(&mut self, equality: &Equality<'t>) -> Result<Self::Output, Self::Error>;
@@ -382,11 +381,40 @@ pub trait Visitor<'t> {
     fn visit_fold<T, Op>(&mut self, fold: &Fold<T, Op>) -> Result<Self::Output, Self::Error>
     where
         Self: Sized,
-        T: Host<'t, Self>,
+        T: ExpressionHost<'t, Self>,
         Op: BinaryOperator<Self::Output, Output: Into<Self::Output>, Error: Into<Self::Error>>
             + Copy,
     {
         fold.host(self)
+    }
+}
+
+pub trait StatementVisitor<'t> {
+    type Output;
+    type Error;
+
+    fn visit_print(&mut self, print: &Expression<'t>) -> Result<Self::Output, Self::Error>;
+
+    fn visit_expression_statement(
+        &mut self,
+        expression: &Expression<'t>,
+    ) -> Result<Self::Output, Self::Error>;
+
+    fn visit_statement(&mut self, statement: &Statement<'t>) -> Result<Self::Output, Self::Error> {
+        match statement {
+            Statement::Expression(expression) => self.visit_expression_statement(expression),
+            Statement::Print(expression) => self.visit_print(expression),
+        }
+    }
+}
+
+pub trait StatementHost<'t, V: StatementVisitor<'t>> {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
+}
+
+impl<'t, V: StatementVisitor<'t>> StatementHost<'t, V> for Statement<'t> {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        visitor.visit_statement(self)
     }
 }
 
@@ -397,26 +425,26 @@ pub trait BinaryOperator<I> {
     fn evaluate(self, lhs: I, rhs: I) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait Host<'t, V: Visitor<'t>> {
+pub trait ExpressionHost<'t, V: ExpressionVisitor<'t>> {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
 }
 
-impl<'t, V: Visitor<'t>> Host<'t, V> for Expression<'t> {
+impl<'t, V: ExpressionVisitor<'t>> ExpressionHost<'t, V> for Expression<'t> {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_expression(self)
     }
 }
 
-impl<'t, V: Visitor<'t>> Host<'t, V> for Unary<'t> {
+impl<'t, V: ExpressionVisitor<'t>> ExpressionHost<'t, V> for Unary<'t> {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_unary(self)
     }
 }
 
-impl<'t, V, T, Op> Host<'t, V> for Fold<T, Op>
+impl<'t, V, T, Op> ExpressionHost<'t, V> for Fold<T, Op>
 where
-    V: Visitor<'t>,
-    T: Host<'t, V>,
+    V: ExpressionVisitor<'t>,
+    T: ExpressionHost<'t, V>,
     Op: BinaryOperator<V::Output, Output: Into<V::Output>, Error: Into<V::Error>> + Copy,
 {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
