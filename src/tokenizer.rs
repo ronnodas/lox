@@ -166,7 +166,7 @@ fn split_first_char(s: &str) -> Option<(char, &str)> {
     chars.next().map(|c| (c, chars.as_str()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     UnexpectedCharacter(char, usize),
     UnterminatedString(usize),

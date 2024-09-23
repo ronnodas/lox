@@ -5,6 +5,7 @@ use std::rc::Rc;
 pub type Identifier = Rc<str>;
 pub type LValue = Identifier;
 
+#[derive(Debug)]
 pub enum Declaration {
     VariableDeclaration {
         identifier: Identifier,
@@ -13,22 +14,27 @@ pub enum Declaration {
     Statement(Statement),
 }
 
+#[derive(Debug)]
 pub enum Statement {
     Expression(Expression),
     Print(Expression),
+    Block(Vec<Declaration>),
 }
 
+#[derive(Debug)]
 pub enum Expression {
     Assignment(Assignment),
     Equality(Equality),
 }
 
+#[derive(Debug)]
 pub struct Assignment {
     pub lvalue: LValue,
     pub expression: Box<Expression>,
 }
 
 // TODO: could make the two operands different types, is that useful anywhere?
+#[derive(Debug)]
 pub struct Fold<T, Op> {
     pub start: T,
     pub more: Vec<(Op, T)>,
@@ -39,18 +45,20 @@ pub type Comparison = Fold<Sum, ComparisonOperator>;
 pub type Sum = Fold<Factor, SumOperator>;
 pub type Factor = Fold<Unary, FactorOperator>;
 
+#[derive(Debug)]
 pub enum Unary {
     Unary(UnaryOperator, Box<Self>),
     Primary(Primary),
 }
 
+#[derive(Debug)]
 pub enum Primary {
     Literal(Value),
     Grouping(Box<Expression>),
     Identifier(Identifier),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Number(f64),
     String(Identifier),
@@ -58,13 +66,13 @@ pub enum Value {
     Nil,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum EqualityOperator {
     Equal,
     NotEqual,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonOperator {
     Greater,
     GreaterEqual,
@@ -78,7 +86,7 @@ impl ComparisonOperator {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SumOperator {
     Minus,
     Plus,
@@ -90,7 +98,7 @@ impl SumOperator {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactorOperator {
     Divide,
     Multiply,
@@ -108,7 +116,7 @@ impl From<Primary> for Unary {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum UnaryOperator {
     Minus,
     Not,
@@ -182,8 +190,7 @@ impl fmt::Display for TypeError {
     }
 }
 
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TypeError {
     Comparison(ComparisonOperator, Value),
     Sum(SumOperator, Value),
@@ -232,10 +239,13 @@ pub trait StatementVisitor {
         initializer: Option<&Expression>,
     ) -> Result<Self::Output, Self::Error>;
 
+    fn visit_block(&mut self, block: &[Declaration]) -> Result<Self::Output, Self::Error>;
+
     fn visit_statement(&mut self, statement: &Statement) -> Result<Self::Output, Self::Error> {
         match statement {
             Statement::Expression(expression) => self.visit_expression_statement(expression),
             Statement::Print(expression) => self.visit_print(expression),
+            Statement::Block(block) => self.visit_block(block),
         }
     }
 

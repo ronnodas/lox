@@ -4,14 +4,15 @@ use std::convert::Infallible;
 use std::{error, fmt, io};
 
 use anyhow::Context as _;
+use itertools::Itertools as _;
 
 use crate::parser::ast::{
     Assignment, BinaryOperator, ComparisonOperator, Declaration, EqualityOperator, Expression,
     ExpressionHost, ExpressionVisitor, FactorOperator, Identifier, Primary, StatementHost as _,
     StatementVisitor, SumOperator, TypeError, Unary, Value,
 };
-use crate::parser::Parser;
-use crate::tokenizer::Tokenizer;
+use crate::parser::{Error as ParseError, Parser};
+use crate::tokenizer::{Error as TokenError, Tokenizer};
 use environment::Environment;
 
 #[derive(Default)]
@@ -20,12 +21,12 @@ pub struct Interpreter {
 }
 
 impl StatementVisitor for Interpreter {
-    type Output = Option<String>;
-    type Error = Error;
+    type Output = Vec<String>;
+    type Error = RuntimeError;
 
     fn visit_print(&mut self, print: &Expression) -> Result<Self::Output, Self::Error> {
         let value = self.visit_expression(print)?;
-        Ok(Some(format!("{value}")))
+        Ok(vec![format!("{value}")])
     }
 
     fn visit_expression_statement(
@@ -33,7 +34,7 @@ impl StatementVisitor for Interpreter {
         expression: &Expression,
     ) -> Result<Self::Output, Self::Error> {
         _ = self.visit_expression(expression)?;
-        Ok(None)
+        Ok(vec![])
     }
 
     fn visit_variable_declaration(
@@ -45,13 +46,24 @@ impl StatementVisitor for Interpreter {
             .map(|expression| self.visit_expression(expression))
             .transpose()?;
         self.environment.declare(identifier, value);
-        Ok(None)
+        Ok(vec![])
+    }
+
+    fn visit_block(&mut self, block: &[Declaration]) -> Result<Self::Output, Self::Error> {
+        self.environment.push();
+        let output = block
+            .iter()
+            .map(|declaration| declaration.host(self))
+            .flatten_ok()
+            .collect();
+        self.environment.pop();
+        output
     }
 }
 
 impl ExpressionVisitor for Interpreter {
     type Output = Value;
-    type Error = Error;
+    type Error = RuntimeError;
 
     fn visit_expression(&mut self, expression: &Expression) -> Result<Self::Output, Self::Error> {
         match expression {
@@ -77,7 +89,7 @@ impl ExpressionVisitor for Interpreter {
             Primary::Identifier(identifier) => self
                 .environment
                 .get(identifier)
-                .ok_or_else(|| Error::UndeclaredVariable(Identifier::clone(identifier))),
+                .ok_or_else(|| RuntimeError::UndeclaredVariable(Identifier::clone(identifier))),
         }
     }
 
@@ -85,7 +97,7 @@ impl ExpressionVisitor for Interpreter {
         let value = assignment.expression.host(self)?;
         let Some(()) = self.environment.set(&assignment.lvalue, value.clone()) else {
             let identifier = Identifier::clone(&assignment.lvalue);
-            return Err(Error::UndeclaredVariable(identifier));
+            return Err(RuntimeError::UndeclaredVariable(identifier));
         };
         Ok(value)
     }
@@ -95,36 +107,29 @@ impl Interpreter {
     pub fn interpret<'i>(
         &'i mut self,
         statements: impl IntoIterator<Item = Declaration> + 'i,
-    ) -> impl Iterator<Item = Result<String, Error>> + 'i {
+    ) -> Result<Vec<String>, RuntimeError> {
         statements
             .into_iter()
-            .filter_map(|declaration| declaration.host(self).transpose())
+            .map(|declaration| declaration.host(self))
+            .flatten_ok()
+            .collect()
     }
 
-    #[must_use]
-    pub fn run<'i>(&'i mut self, source: &str) -> Option<impl Iterator<Item = String> + 'i> {
-        let tokens = Tokenizer::new(source)
-            .into_tokens()
-            .inspect_err(|e| eprintln!("Lexing error: {e}"))
-            .ok()?;
-        let statements: Vec<_> = Parser::new(&tokens)
-            .into_statements()
-            .filter_map(|statement| {
-                statement
-                    .inspect_err(|e| eprintln!("Parsing error: {e}"))
-                    .ok()
-            })
-            .collect();
+    pub fn run<'s>(&mut self, source: &'s str) -> Result<Vec<String>, Error<'s>> {
+        let tokens = Tokenizer::new(source).into_tokens()?;
+        let statements: Vec<Declaration> = Parser::new(&tokens).into_statements().try_collect()?;
 
-        Some(
-            self.interpret(statements)
-                .filter_map(|output| output.inspect_err(|e| eprintln!("Runtime error: {e}")).ok()),
-        )
+        Ok(self.interpret(statements)?)
     }
 
     pub fn run_and_print(&mut self, line: &str) {
-        for output in self.run(line).into_iter().flatten() {
-            println!("{output}");
+        match self.run(line) {
+            Ok(output) => {
+                for output in output {
+                    println!("{output}");
+                }
+            }
+            Err(e) => eprintln!("{e:?}"),
         }
     }
 
@@ -133,6 +138,11 @@ impl Interpreter {
         mut output: impl io::Write,
         mut input: impl Iterator<Item = Result<String, impl error::Error + Send + Sync + 'static>>,
     ) -> anyhow::Result<()> {
+        // TODO QoL:
+        // * implicit print
+        // * add semicolons
+        // * multiline input
+
         loop {
             output.write_all(b"> ")?;
             output.flush()?;
@@ -141,17 +151,18 @@ impl Interpreter {
             };
             let line = line.context("Failed to read line from input")?;
 
-            for print in self.run(&line).into_iter().flatten() {
-                output.write_all(print.as_bytes())?;
+            match self.run(&line) {
+                Ok(print) => {
+                    for print in print {
+                        output.write_all(print.as_bytes())?;
+                        output.write_all(b"\n")?;
+                    }
+                    output.flush()?;
+                }
+                Err(e) => eprintln!("{e:?}"),
             }
-            output.flush()?;
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn collect_output(&mut self, source: &str) -> Option<Vec<String>> {
-        self.run(source).map(Vec::from_iter)
     }
 
     pub fn new() -> Self {
@@ -161,25 +172,50 @@ impl Interpreter {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
+#[derive(Debug, PartialEq)]
+pub enum Error<'t> {
+    Tokenizing(TokenError),
+    Parsing(ParseError<'t>),
+    Runtime(RuntimeError),
+}
+
+impl<'t> From<RuntimeError> for Error<'t> {
+    fn from(v: RuntimeError) -> Self {
+        Self::Runtime(v)
+    }
+}
+
+impl<'t> From<ParseError<'t>> for Error<'t> {
+    fn from(v: ParseError<'t>) -> Self {
+        Self::Parsing(v)
+    }
+}
+
+impl<'t> From<TokenError> for Error<'t> {
+    fn from(v: TokenError) -> Self {
+        Self::Tokenizing(v)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RuntimeError {
     Type(TypeError),
     UndeclaredVariable(Identifier),
 }
 
-impl From<Infallible> for Error {
+impl From<Infallible> for RuntimeError {
     fn from(infallible: Infallible) -> Self {
         match infallible {}
     }
 }
 
-impl From<TypeError> for Error {
+impl From<TypeError> for RuntimeError {
     fn from(v: TypeError) -> Self {
         Self::Type(v)
     }
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Type(error) => write!(f, "Type error: {error}"),
@@ -188,7 +224,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl error::Error for Error {}
+impl error::Error for RuntimeError {}
 
 impl BinaryOperator<Value> for EqualityOperator {
     type Output = bool;

@@ -62,6 +62,20 @@ impl<'t, 'p> Parser<'p, 't> {
         }
     }
 
+    fn block(&mut self) -> Result<Option<Statement>, Error<'t>> {
+        match self.consume(&Token::LeftBrace) {
+            Ok(_) => {
+                let mut declarations = Vec::new();
+                while let Some(declaration) = self.parse()? {
+                    declarations.push(declaration);
+                }
+                self.consume(&Token::RightBrace)
+                    .map(|_| Some(Statement::Block(declarations)))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     const fn unexpected(&self) -> Error<'t> {
         match self.tokens.first() {
             Some(&token) => Error::UnexpectedToken(token),
@@ -158,7 +172,10 @@ impl<'t> Parse<'t> for Statement {
         if let statement @ Some(_) = parser.print_statement()? {
             return Ok(statement);
         }
-        parser.expression_statement()
+        if let statement @ Some(_) = parser.expression_statement()? {
+            return Ok(statement);
+        }
+        parser.block()
     }
 }
 
@@ -331,7 +348,7 @@ impl<'t> MatchToken<'t> for Value {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error<'t> {
     UnexpectedToken(SourceToken<'t>),
     UnmatchedParen(usize),

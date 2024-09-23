@@ -37,7 +37,7 @@ mod tests {
         let mut interpreter = Interpreter::new();
 
         let source = "print \"one\";\nprint true;\nprint 2 + 1;";
-        let output = interpreter.collect_output(source).unwrap();
+        let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["\"one\"", "true", "3"]);
     }
 
@@ -46,7 +46,7 @@ mod tests {
         let mut interpreter = Interpreter::new();
 
         let source = "var beverage = \"espresso\"; print beverage;";
-        let output = interpreter.collect_output(source).unwrap();
+        let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["\"espresso\""]);
     }
 
@@ -55,7 +55,7 @@ mod tests {
         let mut interpreter = Interpreter::new();
 
         let source = "var a = \"before\"; print a; var a = \"after\"; print a;";
-        let output = interpreter.collect_output(source).unwrap();
+        let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["\"before\"", "\"after\""]);
     }
 
@@ -64,11 +64,11 @@ mod tests {
         let mut interpreter = Interpreter::new();
 
         let source = "var a; print a;";
-        let output = interpreter.collect_output(source).unwrap();
+        let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["nil"]);
 
         let source = "var a = 1; var b = 2; print a + b;";
-        let output = interpreter.collect_output(source).unwrap();
+        let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["3"]);
     }
 
@@ -77,7 +77,7 @@ mod tests {
         let mut interpreter = Interpreter::new();
 
         let source = "var a = \"before\"; a = \"value\"; print a;";
-        let output = interpreter.collect_output(source).unwrap();
+        let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["\"value\""]);
     }
 
@@ -85,7 +85,42 @@ mod tests {
     fn test_8_4_2() {
         let mut interpreter = Interpreter::new();
         let source = "var a = 1; print a = 2;";
-        let output = interpreter.collect_output(source).unwrap();
+        let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["2"]);
+    }
+
+    #[test]
+    fn test_8_5() {
+        use crate::interpreter::{Error, RuntimeError};
+        let mut interpreter = Interpreter::new();
+
+        let source = "{  var a = \"in block\"; } print a;";
+        let output = interpreter.run(source).unwrap_err();
+        assert_eq!(
+            output,
+            Error::Runtime(RuntimeError::UndeclaredVariable("a".into()))
+        );
+    }
+
+    #[test]
+    fn test_8_5_2() {
+        let mut interpreter = Interpreter::new();
+
+        let source = "var a = \"global a\"; var b = \"global b\"; var c = \"global c\"; { var a = \"outer a\"; var b = \"outer b\"; { var a = \"inner a\"; print a; print b; print c; } print a; print b; print c; } print a; print b; print c;";
+        let output = interpreter.run(source).unwrap();
+        assert_eq!(
+            output,
+            vec![
+                "\"inner a\"",
+                "\"outer b\"",
+                "\"global c\"",
+                "\"outer a\"",
+                "\"outer b\"",
+                "\"global c\"",
+                "\"global a\"",
+                "\"global b\"",
+                "\"global c\""
+            ]
+        );
     }
 }
