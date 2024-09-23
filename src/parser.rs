@@ -3,7 +3,10 @@ pub mod ast;
 use std::iter::from_fn;
 use std::{error, fmt};
 
-use ast::{Equality, Expression, Fold, MatchToken, Primary, Statement, Unary, Value};
+use ast::{
+    ComparisonOperator, Declaration, Equality, EqualityOperator, Expression, FactorOperator, Fold,
+    Primary, Statement, SumOperator, Unary, UnaryOperator, Value,
+};
 
 use crate::tokenizer::{SourceToken, Token};
 
@@ -16,9 +19,7 @@ impl<'t, 'p> Parser<'p, 't> {
         Self { tokens }
     }
 
-    pub fn into_statements(
-        mut self,
-    ) -> impl Iterator<Item = Result<Statement<'t>, Error<'t>>> + 'p {
+    pub fn into_statements(mut self) -> impl Iterator<Item = Result<Declaration, Error<'t>>> + 'p {
         from_fn(move || {
             let statement = self.parse().transpose()?;
             if statement.is_err() {
@@ -32,31 +33,30 @@ impl<'t, 'p> Parser<'p, 't> {
         T::parse(self)
     }
 
-    fn print_statement(&mut self) -> Result<Option<Statement<'t>>, Error<'t>> {
-        if let Ok(&SourceToken { line, .. }) = self.consume(&Token::Print) {
-            let Some(expression) = self.parse()? else {
-                return Err(self.unexpected());
-            };
+    fn print_statement(&mut self) -> Result<Option<Statement>, Error<'t>> {
+        let Ok(SourceToken { line, .. }) = self.consume(&Token::Print) else {
+            return Ok(None);
+        };
+        let Some(expression) = self.parse()? else {
+            return Err(self.unexpected());
+        };
 
-            if self.consume(&Token::Semicolon).is_ok() {
-                Ok(Some(Statement::Print(expression)))
-            } else {
-                Err(Error::UnterminatedPrint(line))
-            }
+        if self.consume(&Token::Semicolon).is_ok() {
+            Ok(Some(Statement::Print(expression)))
         } else {
-            Ok(None)
+            Err(Error::UnterminatedPrint(line))
         }
     }
 
-    fn expression_statement(&mut self) -> Result<Option<Statement<'t>>, Error<'t>> {
+    fn expression_statement(&mut self) -> Result<Option<Statement>, Error<'t>> {
         let Some(expression) = self.parse()? else {
             return Ok(None);
         };
 
-        if self.consume(&Token::Semicolon).is_ok() {
-            Ok(Some(Statement::Expression(expression)))
-        } else {
-            Err(self.unexpected())
+        match self.consume(&Token::Semicolon) {
+            // TODO use map
+            Ok(_) => Ok(Some(Statement::Expression(expression))),
+            Err(e) => Err(e),
         }
     }
 
@@ -67,20 +67,36 @@ impl<'t, 'p> Parser<'p, 't> {
         }
     }
 
-    fn consume(&mut self, token: &Token) -> Result<&SourceToken, Option<&SourceToken>> {
-        if let Some((next @ SourceToken { token: t, .. }, rest)) = self.tokens.split_first() {
-            if t == token {
+    fn consume(&mut self, token: &Token) -> Result<SourceToken, Error<'t>> {
+        if let Some((&next @ SourceToken { token: t, .. }, rest)) = self.tokens.split_first() {
+            if &t == token {
                 self.tokens = rest;
                 Ok(next)
             } else {
-                Err(Some(next))
+                Err(Error::UnexpectedToken(next))
             }
         } else {
-            Err(None)
+            Err(Error::UnexpectedEndOfInput)
         }
     }
 
-    fn try_read_any<T: MatchToken<'t>>(&mut self) -> Option<T> {
+    fn consume_identifier(&mut self) -> Option<&'t str> {
+        if let (
+            SourceToken {
+                token: Token::Identifier(identifier),
+                ..
+            },
+            rest,
+        ) = self.tokens.split_first()?
+        {
+            self.tokens = rest;
+            Some(identifier)
+        } else {
+            None
+        }
+    }
+
+    fn consume_and_match<T: MatchToken<'t>>(&mut self) -> Option<T> {
         let (next, rest) = self.tokens.split_first()?;
         if let Some(next) = T::match_token(next.token) {
             self.tokens = rest;
@@ -98,6 +114,27 @@ impl<'t, 'p> Parser<'p, 't> {
         };
         self.tokens = &self.tokens[mid..];
     }
+
+    fn variable_declaration(&mut self) -> Result<Option<Declaration>, Error<'t>> {
+        let Ok(_) = self.consume(&Token::Var) else {
+            return Ok(None);
+        };
+        let Some(Primary::Identifier(identifier)) = self.parse()? else {
+            return Err(self.unexpected());
+        };
+        let initializer = match self.consume(&Token::Equal) {
+            Ok(_) => self.parse()?,
+            Err(_) => None,
+        };
+        match self.consume(&Token::Semicolon) {
+            // TODO use map
+            Ok(_) => Ok(Some(Declaration::VariableDeclaration {
+                identifier,
+                initializer,
+            })),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 pub trait Parse<'t>: Sized {
@@ -105,7 +142,16 @@ pub trait Parse<'t>: Sized {
 }
 
 //TODO maybe inline and restructure once all the different statements are implemented
-impl<'t> Parse<'t> for Statement<'t> {
+impl<'t> Parse<'t> for Declaration {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
+        if let declaration @ Some(_) = parser.variable_declaration()? {
+            return Ok(declaration);
+        }
+        Ok(parser.parse()?.map(Self::Statement))
+    }
+}
+
+impl<'t> Parse<'t> for Statement {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
         if let statement @ Some(_) = parser.print_statement()? {
             return Ok(statement);
@@ -114,7 +160,7 @@ impl<'t> Parse<'t> for Statement<'t> {
     }
 }
 
-impl<'t> Parse<'t> for Expression<'t> {
+impl<'t> Parse<'t> for Expression {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
         parser.parse::<Equality>().map(|e| e.map(Self::from))
     }
@@ -127,7 +173,7 @@ impl<'t, T: Parse<'t>, Op: MatchToken<'t>> Parse<'t> for Fold<T, Op> {
             return Ok(None);
         };
         let mut more = Vec::new();
-        while let Some(operator) = this.try_read_any() {
+        while let Some(operator) = this.consume_and_match() {
             let Some(right) = this.parse()? else {
                 return Err(this.unexpected());
             };
@@ -137,23 +183,26 @@ impl<'t, T: Parse<'t>, Op: MatchToken<'t>> Parse<'t> for Fold<T, Op> {
     }
 }
 
-impl<'t> Parse<'t> for Unary<'t> {
+impl<'t> Parse<'t> for Unary {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
-        if let Some(operator) = parser.try_read_any() {
+        if let Some(operator) = parser.consume_and_match() {
             let Some(right) = parser.parse()? else {
                 return Err(parser.unexpected());
             };
             Ok(Some(Self::Unary(operator, Box::new(right))))
         } else {
-            parser.parse::<Primary<'t>>().map(|e| e.map(Self::from))
+            parser.parse::<Primary>().map(|e| e.map(Self::from))
         }
     }
 }
 
-impl<'t> Parse<'t> for Primary<'t> {
+impl<'t> Parse<'t> for Primary {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
-        if let Some(primary) = parser.try_read_any::<Value<'t>>() {
+        if let Some(primary) = parser.consume_and_match::<Value>() {
             return Ok(Some(primary.into()));
+        }
+        if let Some(identifier) = parser.consume_identifier() {
+            return Ok(Some(Self::Identifier(identifier.into())));
         }
         let Some((
             &SourceToken {
@@ -183,9 +232,84 @@ impl<'t> Parse<'t> for Primary<'t> {
                 rest,
             )) => {
                 parser.tokens = rest;
-                Ok(Some(Primary::group(expression)))
+                Ok(Some(Self::group(expression)))
             }
             Some((&token, _)) => Err(Error::UnexpectedToken(token)),
+        }
+    }
+}
+
+pub trait MatchToken<'t>: Sized {
+    fn match_token(token: Token<'t>) -> Option<Self>;
+}
+
+#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
+impl<'t> MatchToken<'t> for EqualityOperator {
+    fn match_token(token: Token) -> Option<Self> {
+        match token {
+            Token::BangEqual => Some(Self::NotEqual),
+            Token::EqualEqual => Some(Self::Equal),
+            _ => None,
+        }
+    }
+}
+
+#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
+impl<'t> MatchToken<'t> for ComparisonOperator {
+    fn match_token(token: Token) -> Option<Self> {
+        match token {
+            Token::Greater => Some(Self::Greater),
+            Token::GreaterEqual => Some(Self::GreaterEqual),
+            Token::Less => Some(Self::Less),
+            Token::LessEqual => Some(Self::LessEqual),
+            _ => None,
+        }
+    }
+}
+
+#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
+impl<'t> MatchToken<'t> for SumOperator {
+    fn match_token(token: Token<'t>) -> Option<Self> {
+        match token {
+            Token::Minus => Some(Self::Minus),
+            Token::Plus => Some(Self::Plus),
+            _ => None,
+        }
+    }
+}
+
+#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
+impl<'t> MatchToken<'t> for FactorOperator {
+    fn match_token(token: Token<'t>) -> Option<Self> {
+        match token {
+            Token::Slash => Some(Self::Divide),
+            Token::Star => Some(Self::Multiply),
+            _ => None,
+        }
+    }
+}
+
+#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
+impl<'t> MatchToken<'t> for UnaryOperator {
+    fn match_token(token: Token<'t>) -> Option<Self> {
+        match token {
+            Token::Minus => Some(Self::Minus),
+            Token::Bang => Some(Self::Not),
+            _ => None,
+        }
+    }
+}
+
+#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
+impl<'t> MatchToken<'t> for Value {
+    fn match_token(token: Token<'t>) -> Option<Self> {
+        match token {
+            Token::Number(number) => Some(Self::Number(number)),
+            Token::String(string) => Some(Self::String(string.into())),
+            Token::False => Some(Self::Boolean(false)),
+            Token::True => Some(Self::Boolean(true)),
+            Token::Nil => Some(Self::Nil),
+            _ => None,
         }
     }
 }

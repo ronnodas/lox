@@ -1,16 +1,24 @@
 use core::fmt;
-use std::borrow::Cow;
 use std::error;
+use std::rc::Rc;
 
-use crate::tokenizer::Token;
+pub type Identifier = Rc<str>;
 
-pub enum Expression<'t> {
-    Equality(Equality<'t>),
+pub enum Declaration {
+    VariableDeclaration {
+        identifier: Identifier,
+        initializer: Option<Expression>,
+    },
+    Statement(Statement),
 }
 
-pub enum Statement<'t> {
-    Expression(Expression<'t>),
-    Print(Expression<'t>),
+pub enum Statement {
+    Expression(Expression),
+    Print(Expression),
+}
+
+pub enum Expression {
+    Equality(Equality),
 }
 
 // TODO: could make the two operands different types, is that useful anywhere?
@@ -19,10 +27,29 @@ pub struct Fold<T, Op> {
     pub more: Vec<(Op, T)>,
 }
 
-pub type Equality<'t> = Fold<Comparison<'t>, EqualityOperator>;
-pub type Comparison<'t> = Fold<Sum<'t>, ComparisonOperator>;
-pub type Sum<'t> = Fold<Factor<'t>, SumOperator>;
-pub type Factor<'t> = Fold<Unary<'t>, FactorOperator>;
+pub type Equality = Fold<Comparison, EqualityOperator>;
+pub type Comparison = Fold<Sum, ComparisonOperator>;
+pub type Sum = Fold<Factor, SumOperator>;
+pub type Factor = Fold<Unary, FactorOperator>;
+
+pub enum Unary {
+    Unary(UnaryOperator, Box<Self>),
+    Primary(Primary),
+}
+
+pub enum Primary {
+    Literal(Value),
+    Grouping(Box<Expression>),
+    Identifier(Identifier),
+}
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Number(f64),
+    String(Identifier),
+    Boolean(bool),
+    Nil,
+}
 
 #[derive(Clone, Copy)]
 pub enum EqualityOperator {
@@ -39,8 +66,8 @@ pub enum ComparisonOperator {
 }
 
 impl ComparisonOperator {
-    pub fn cast(self, value: Value<'_>) -> Result<f64, TypeError<'_>> {
-        value.to_float().ok_or(TypeError::Comparison(self, value))
+    pub fn cast(self, value: Value) -> Result<f64, TypeError> {
+        value.float().ok_or(TypeError::Comparison(self, value))
     }
 }
 
@@ -51,9 +78,8 @@ pub enum SumOperator {
 }
 
 impl SumOperator {
-    pub fn cast<'a>(self, lhs: &Value<'a>) -> Result<f64, TypeError<'a>> {
-        lhs.to_float()
-            .ok_or_else(|| TypeError::Sum(self, lhs.clone()))
+    pub fn cast(self, lhs: &Value) -> Result<f64, TypeError> {
+        lhs.float().ok_or_else(|| TypeError::Sum(self, lhs.clone()))
     }
 }
 
@@ -64,18 +90,13 @@ pub enum FactorOperator {
 }
 
 impl FactorOperator {
-    pub fn cast(self, lhs: Value<'_>) -> Result<f64, TypeError<'_>> {
-        lhs.to_float().ok_or(TypeError::Factor(self, lhs))
+    pub fn cast(self, lhs: Value) -> Result<f64, TypeError> {
+        lhs.float().ok_or(TypeError::Factor(self, lhs))
     }
 }
 
-pub enum Unary<'t> {
-    Unary(UnaryOperator, Box<Self>),
-    Primary(Primary<'t>),
-}
-
-impl<'t> From<Primary<'t>> for Unary<'t> {
-    fn from(v: Primary<'t>) -> Self {
+impl From<Primary> for Unary {
+    fn from(v: Primary) -> Self {
         Self::Primary(v)
     }
 }
@@ -87,76 +108,55 @@ pub enum UnaryOperator {
 }
 
 impl UnaryOperator {
-    pub(crate) fn evaluate(self, value: Value<'_>) -> Result<Value<'_>, TypeError<'_>> {
+    pub(crate) fn evaluate(self, value: Value) -> Result<Value, TypeError> {
         match self {
             Self::Minus => {
-                let value = value.to_float().ok_or(TypeError::UnaryMinus(value))?;
+                let value = value.float().ok_or(TypeError::UnaryMinus(value))?;
                 Ok(Value::Number(-value))
             }
-            Self::Not => Ok(Value::Boolean(!value.to_boolean())),
+            Self::Not => Ok(Value::Boolean(!value.boolean())),
         }
     }
 }
 
-pub enum Primary<'t> {
-    Literal(Value<'t>),
-    Grouping(Box<Expression<'t>>),
-}
-
-impl<'t> From<Value<'t>> for Primary<'t> {
-    fn from(v: Value<'t>) -> Self {
+impl From<Value> for Primary {
+    fn from(v: Value) -> Self {
         Self::Literal(v)
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Value<'t> {
-    Number(f64),
-    String(Cow<'t, str>),
-    Boolean(bool),
-    Nil,
-}
-
-impl<'t> From<f64> for Value<'t> {
+impl From<f64> for Value {
     fn from(v: f64) -> Self {
         Self::Number(v)
     }
 }
 
-impl<'t> From<bool> for Value<'t> {
+impl From<bool> for Value {
     fn from(v: bool) -> Self {
         Self::Boolean(v)
     }
 }
 
-impl<'v> Value<'v> {
-    const fn to_float(&self) -> Option<f64> {
+impl Value {
+    const fn float(&self) -> Option<f64> {
         match self {
-            &Value::Number(number) => Some(number),
-            &Value::Boolean(boolean) => Some(if boolean { 1.0 } else { 0.0 }),
-            Value::String(_) | Value::Nil => None,
+            &Self::Number(number) => Some(number),
+            &Self::Boolean(boolean) => Some(if boolean { 1.0 } else { 0.0 }),
+            Self::String(_) | Self::Nil => None,
         }
     }
 
-    const fn to_boolean(&self) -> bool {
+    const fn boolean(&self) -> bool {
         match self {
-            &Value::Boolean(boolean) => boolean,
-            Value::Nil => false,
-            Value::Number(_) | Value::String(_) => true,
+            &Self::Boolean(boolean) => boolean,
+            Self::Nil => false,
+            Self::Number(_) | Self::String(_) => true,
         }
     }
 }
 
-#[derive(Debug)]
-pub enum TypeError<'e> {
-    Comparison(ComparisonOperator, Value<'e>),
-    Sum(SumOperator, Value<'e>),
-    Factor(FactorOperator, Value<'e>),
-    UnaryMinus(Value<'e>),
-}
-
-impl fmt::Display for TypeError<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl fmt::Display for TypeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Comparison(operator, value) => {
                 write!(
@@ -204,131 +204,86 @@ impl fmt::Display for FactorOperator {
     }
 }
 
-impl error::Error for TypeError<'_> {}
+#[derive(Debug)]
+pub enum TypeError {
+    Comparison(ComparisonOperator, Value),
+    Sum(SumOperator, Value),
+    Factor(FactorOperator, Value),
+    UnaryMinus(Value),
+}
 
-impl<'t> Primary<'t> {
-    pub(crate) fn group(expression: Expression<'t>) -> Self {
+impl error::Error for TypeError {}
+
+impl Primary {
+    pub(crate) fn group(expression: Expression) -> Self {
         Self::Grouping(Box::new(expression))
     }
 }
 
-impl<'t> From<Equality<'t>> for Expression<'t> {
-    fn from(v: Equality<'t>) -> Self {
+impl From<Equality> for Expression {
+    fn from(v: Equality) -> Self {
         Self::Equality(v)
     }
 }
 
-pub trait MatchToken<'t>: Sized {
-    fn match_token(token: Token<'t>) -> Option<Self>;
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for EqualityOperator {
-    fn match_token(token: Token) -> Option<Self> {
-        match token {
-            Token::BangEqual => Some(Self::NotEqual),
-            Token::EqualEqual => Some(Self::Equal),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for ComparisonOperator {
-    fn match_token(token: Token) -> Option<Self> {
-        match token {
-            Token::Greater => Some(Self::Greater),
-            Token::GreaterEqual => Some(Self::GreaterEqual),
-            Token::Less => Some(Self::Less),
-            Token::LessEqual => Some(Self::LessEqual),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for SumOperator {
-    fn match_token(token: Token<'t>) -> Option<Self> {
-        match token {
-            Token::Minus => Some(Self::Minus),
-            Token::Plus => Some(Self::Plus),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for FactorOperator {
-    fn match_token(token: Token<'t>) -> Option<Self> {
-        match token {
-            Token::Slash => Some(Self::Divide),
-            Token::Star => Some(Self::Multiply),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for UnaryOperator {
-    fn match_token(token: Token<'t>) -> Option<Self> {
-        match token {
-            Token::Minus => Some(Self::Minus),
-            Token::Bang => Some(Self::Not),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for Value<'t> {
-    fn match_token(token: Token<'t>) -> Option<Self> {
-        match token {
-            Token::Number(number) => Some(Self::Number(number)),
-            Token::String(string) => Some(Self::String(string.into())),
-            Token::False => Some(Self::Boolean(false)),
-            Token::True => Some(Self::Boolean(true)),
-            Token::Nil => Some(Self::Nil),
-            _ => None,
-        }
-    }
-}
-
-pub trait ExpressionVisitor<'t> {
+pub trait ExpressionVisitor {
     type Output;
     type Error;
 
-    fn visit_expression(
-        &mut self,
-        expression: &Expression<'t>,
-    ) -> Result<Self::Output, Self::Error>;
-    fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error>;
-    fn visit_primary(&mut self, primary: &Primary<'t>) -> Result<Self::Output, Self::Error>;
+    fn visit_expression(&mut self, expression: &Expression) -> Result<Self::Output, Self::Error>;
+    fn visit_unary(&mut self, unary: &Unary) -> Result<Self::Output, Self::Error>;
+    fn visit_primary(&mut self, primary: &Primary) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait StatementVisitor<'t> {
+pub trait StatementVisitor {
     type Output;
     type Error;
 
-    fn visit_print(&mut self, print: &Expression<'t>) -> Result<Self::Output, Self::Error>;
+    fn visit_print(&mut self, print: &Expression) -> Result<Self::Output, Self::Error>;
 
     fn visit_expression_statement(
         &mut self,
-        expression: &Expression<'t>,
+        expression: &Expression,
     ) -> Result<Self::Output, Self::Error>;
 
-    fn visit_statement(&mut self, statement: &Statement<'t>) -> Result<Self::Output, Self::Error> {
+    fn visit_variable_declaration(
+        &mut self,
+        identifier: &str,
+        initializer: Option<&Expression>,
+    ) -> Result<Self::Output, Self::Error>;
+
+    fn visit_statement(&mut self, statement: &Statement) -> Result<Self::Output, Self::Error> {
         match statement {
             Statement::Expression(expression) => self.visit_expression_statement(expression),
             Statement::Print(expression) => self.visit_print(expression),
         }
     }
+
+    fn visit_declaration(
+        &mut self,
+        declaration: &Declaration,
+    ) -> Result<Self::Output, Self::Error> {
+        match declaration {
+            Declaration::VariableDeclaration {
+                identifier,
+                initializer,
+            } => self.visit_variable_declaration(identifier, initializer.as_ref()),
+            Declaration::Statement(statement) => self.visit_statement(statement),
+        }
+    }
 }
 
-pub trait StatementHost<'t, V: StatementVisitor<'t>> {
+pub trait StatementHost<V: StatementVisitor> {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
 }
 
-impl<'t, V: StatementVisitor<'t>> StatementHost<'t, V> for Statement<'t> {
+impl<V: StatementVisitor> StatementHost<V> for Declaration {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        visitor.visit_declaration(self)
+    }
+}
+
+impl<V: StatementVisitor> StatementHost<V> for Statement {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_statement(self)
     }
@@ -341,26 +296,26 @@ pub trait BinaryOperator<I> {
     fn evaluate(self, lhs: I, rhs: I) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait ExpressionHost<'t, V: ExpressionVisitor<'t>> {
+pub trait ExpressionHost<V: ExpressionVisitor> {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
 }
 
-impl<'t, V: ExpressionVisitor<'t>> ExpressionHost<'t, V> for Expression<'t> {
+impl<V: ExpressionVisitor> ExpressionHost<V> for Expression {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_expression(self)
     }
 }
 
-impl<'t, V: ExpressionVisitor<'t>> ExpressionHost<'t, V> for Unary<'t> {
+impl<V: ExpressionVisitor> ExpressionHost<V> for Unary {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_unary(self)
     }
 }
 
-impl<'t, V, T, Op> ExpressionHost<'t, V> for Fold<T, Op>
+impl<V, T, Op> ExpressionHost<V> for Fold<T, Op>
 where
-    V: ExpressionVisitor<'t>,
-    T: ExpressionHost<'t, V>,
+    V: ExpressionVisitor,
+    T: ExpressionHost<V>,
     Op: BinaryOperator<V::Output, Output: Into<V::Output>, Error: Into<V::Error>> + Copy,
 {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
@@ -375,7 +330,7 @@ where
     }
 }
 
-impl fmt::Display for Value<'_> {
+impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Number(number) => {

@@ -1,50 +1,66 @@
+mod environment;
+
 use std::convert::Infallible;
 use std::{error, fmt, io};
 
 use anyhow::Context as _;
 
 use crate::parser::ast::{
-    BinaryOperator, ComparisonOperator, EqualityOperator, Expression, ExpressionHost,
-    ExpressionVisitor, FactorOperator, Primary, Statement, StatementHost as _, StatementVisitor,
+    BinaryOperator, ComparisonOperator, Declaration, EqualityOperator, Expression, ExpressionHost,
+    ExpressionVisitor, FactorOperator, Identifier, Primary, StatementHost as _, StatementVisitor,
     SumOperator, TypeError, Unary, Value,
 };
 use crate::parser::Parser;
 use crate::tokenizer::Tokenizer;
+use environment::Environment;
 
-pub struct Interpreter;
+#[derive(Default)]
+pub struct Interpreter {
+    environment: Environment,
+}
 
-impl<'t> StatementVisitor<'t> for Interpreter {
+impl StatementVisitor for Interpreter {
     type Output = Option<String>;
-    type Error = Error<'t>;
+    type Error = Error;
 
-    fn visit_print(&mut self, print: &Expression<'t>) -> Result<Self::Output, Self::Error> {
+    fn visit_print(&mut self, print: &Expression) -> Result<Self::Output, Self::Error> {
         let value = self.visit_expression(print)?;
         Ok(Some(format!("{value}")))
     }
 
     fn visit_expression_statement(
         &mut self,
-        expression: &Expression<'t>,
+        expression: &Expression,
     ) -> Result<Self::Output, Self::Error> {
         _ = self.visit_expression(expression)?;
         Ok(None)
     }
+
+    fn visit_variable_declaration(
+        &mut self,
+        identifier: &str,
+        initializer: Option<&Expression>,
+    ) -> Result<Self::Output, Self::Error> {
+        let value = initializer
+            .map(|expression| self.visit_expression(expression))
+            .transpose()?
+            .unwrap_or(Value::Nil);
+        self.environment.set(identifier, value);
+        Ok(None)
+    }
 }
 
-impl<'t> ExpressionVisitor<'t> for Interpreter {
-    type Output = Value<'t>;
-    type Error = Error<'t>;
+impl ExpressionVisitor for Interpreter {
+    type Output = Value;
+    type Error = Error;
 
-    fn visit_expression(
-        &mut self,
-        expression: &Expression<'t>,
-    ) -> Result<Self::Output, Self::Error> {
+    fn visit_expression(&mut self, expression: &Expression) -> Result<Self::Output, Self::Error> {
         match expression {
             Expression::Equality(equality) => equality.host(self),
         }
     }
 
-    fn visit_unary(&mut self, unary: &Unary<'t>) -> Result<Self::Output, Self::Error> {
+    fn visit_unary(&mut self, unary: &Unary) -> Result<Self::Output, Self::Error> {
         match unary {
             Unary::Unary(op, unary) => {
                 let unary = self.visit_unary(unary)?;
@@ -54,29 +70,30 @@ impl<'t> ExpressionVisitor<'t> for Interpreter {
         }
     }
 
-    fn visit_primary(&mut self, primary: &Primary<'t>) -> Result<Self::Output, Self::Error> {
+    fn visit_primary(&mut self, primary: &Primary) -> Result<Self::Output, Self::Error> {
         match primary {
             Primary::Literal(value) => Ok(value.clone()),
             Primary::Grouping(expression) => self.visit_expression(expression),
+            Primary::Identifier(identifier) => self
+                .environment
+                .get(identifier)
+                .ok_or_else(|| Error::UndeclaredVariable(Identifier::clone(identifier))),
         }
     }
 }
 
 impl Interpreter {
-    pub fn interpret<'s, 'i: 's>(
+    pub fn interpret<'i>(
         &'i mut self,
-        statements: impl IntoIterator<Item = Statement<'s>> + 's,
-    ) -> impl Iterator<Item = Result<String, Error<'s>>> + 's {
+        statements: impl IntoIterator<Item = Declaration> + 'i,
+    ) -> impl Iterator<Item = Result<String, Error>> + 'i {
         statements
             .into_iter()
-            .filter_map(|statement| statement.host(self).transpose())
+            .filter_map(|declaration| declaration.host(self).transpose())
     }
 
     #[must_use]
-    pub fn run<'s, 'i: 's>(
-        &'i mut self,
-        source: &'s str,
-    ) -> Option<impl Iterator<Item = String> + 's> {
+    pub fn run<'i>(&'i mut self, source: &str) -> Option<impl Iterator<Item = String> + 'i> {
         let tokens = Tokenizer::new(source)
             .into_tokens()
             .inspect_err(|e| eprintln!("Lexing error: {e}"))
@@ -127,41 +144,49 @@ impl Interpreter {
     pub fn collect_output(&mut self, source: &str) -> Option<Vec<String>> {
         self.run(source).map(Vec::from_iter)
     }
+
+    pub fn new() -> Self {
+        Self {
+            environment: Environment::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
-pub enum Error<'e> {
-    Type(TypeError<'e>),
+pub enum Error {
+    Type(TypeError),
+    UndeclaredVariable(Identifier),
 }
 
-impl<'e> From<Infallible> for Error<'e> {
+impl From<Infallible> for Error {
     fn from(infallible: Infallible) -> Self {
         match infallible {}
     }
 }
 
-impl<'e> From<TypeError<'e>> for Error<'e> {
-    fn from(v: TypeError<'e>) -> Self {
+impl From<TypeError> for Error {
+    fn from(v: TypeError) -> Self {
         Self::Type(v)
     }
 }
 
-impl fmt::Display for Error<'_> {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Type(error) => write!(f, "Type error: {error}"),
+            Self::Type(error) => write!(f, "Type error: {error}"),
+            Self::UndeclaredVariable(identifer) => write!(f, "Undeclared variable: {identifer}"),
         }
     }
 }
 
-impl error::Error for Error<'_> {}
+impl error::Error for Error {}
 
-impl<'t> BinaryOperator<Value<'t>> for EqualityOperator {
+impl BinaryOperator<Value> for EqualityOperator {
     type Output = bool;
     type Error = Infallible;
 
     #[expect(clippy::float_cmp, reason = "Lox spec is weird")]
-    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<bool, Self::Error> {
+    fn evaluate(self, lhs: Value, rhs: Value) -> Result<bool, Self::Error> {
         let equal = match (lhs, rhs) {
             (Value::Number(lhs), Value::Number(rhs)) => lhs == rhs,
             (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
@@ -176,11 +201,11 @@ impl<'t> BinaryOperator<Value<'t>> for EqualityOperator {
     }
 }
 
-impl<'t> BinaryOperator<Value<'t>> for ComparisonOperator {
+impl BinaryOperator<Value> for ComparisonOperator {
     type Output = bool;
-    type Error = TypeError<'t>;
+    type Error = TypeError;
 
-    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<bool, Self::Error> {
+    fn evaluate(self, lhs: Value, rhs: Value) -> Result<bool, Self::Error> {
         let lhs = self.cast(lhs)?;
         let rhs = self.cast(rhs)?;
         Ok(match self {
@@ -192,11 +217,11 @@ impl<'t> BinaryOperator<Value<'t>> for ComparisonOperator {
     }
 }
 
-impl<'t> BinaryOperator<Value<'t>> for SumOperator {
-    type Output = Value<'t>;
-    type Error = TypeError<'t>;
+impl BinaryOperator<Value> for SumOperator {
+    type Output = Value;
+    type Error = TypeError;
 
-    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<Self::Output, Self::Error> {
+    fn evaluate(self, lhs: Value, rhs: Value) -> Result<Self::Output, Self::Error> {
         if let (Value::String(lhs), Self::Plus, Value::String(rhs)) = (&lhs, self, &rhs) {
             let string = lhs.as_ref().to_owned() + rhs.as_ref();
             return Ok(Value::String(string.into()));
@@ -210,11 +235,11 @@ impl<'t> BinaryOperator<Value<'t>> for SumOperator {
     }
 }
 
-impl<'t> BinaryOperator<Value<'t>> for FactorOperator {
+impl BinaryOperator<Value> for FactorOperator {
     type Output = f64;
-    type Error = TypeError<'t>;
+    type Error = TypeError;
 
-    fn evaluate(self, lhs: Value<'t>, rhs: Value<'t>) -> Result<f64, Self::Error> {
+    fn evaluate(self, lhs: Value, rhs: Value) -> Result<f64, Self::Error> {
         let lhs = self.cast(lhs)?;
         let rhs = self.cast(rhs)?;
         Ok(match self {

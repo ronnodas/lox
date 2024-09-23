@@ -282,7 +282,7 @@ impl<'a> SourceToken<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{SourceToken, Token, Tokenizer};
 
     #[test]
     fn tokenizer() {

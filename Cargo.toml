@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.89"
-clap = { version = "4.5.17", features = ["derive"] }
+clap = { version = "4.5.18", features = ["derive"] }
 itertools = "0.13.0"
 
 
@@ -57,6 +57,7 @@ string_lit_chars_any = "warn"
 string_slice = "warn"
 string_to_string = "warn"
 suspicious_xor_used_as_pow = "warn"
+todo = "warn"
 try_err = "warn"
 unnecessary_self_imports = "warn"
 unneeded_field_pattern = "warn"
