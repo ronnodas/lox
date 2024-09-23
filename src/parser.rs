@@ -1,11 +1,13 @@
 pub mod ast;
+pub mod printer;
 
 use std::iter::from_fn;
 use std::{error, fmt};
 
 use ast::{
-    ComparisonOperator, Declaration, Equality, EqualityOperator, Expression, FactorOperator, Fold,
-    Primary, Statement, SumOperator, Unary, UnaryOperator, Value,
+    Assignment, ComparisonOperator, Declaration, Equality, EqualityOperator, Expression,
+    FactorOperator, Fold, Identifier, IntoLValue as _, Primary, Statement, SumOperator, Unary,
+    UnaryOperator, Value,
 };
 
 use crate::tokenizer::{SourceToken, Token};
@@ -80,9 +82,9 @@ impl<'t, 'p> Parser<'p, 't> {
         }
     }
 
-    fn consume_identifier(&mut self) -> Option<&'t str> {
+    fn consume_identifier(&mut self) -> Option<Identifier> {
         if let (
-            SourceToken {
+            &SourceToken {
                 token: Token::Identifier(identifier),
                 ..
             },
@@ -90,7 +92,7 @@ impl<'t, 'p> Parser<'p, 't> {
         ) = self.tokens.split_first()?
         {
             self.tokens = rest;
-            Some(identifier)
+            Some(identifier.into())
         } else {
             None
         }
@@ -162,7 +164,22 @@ impl<'t> Parse<'t> for Statement {
 
 impl<'t> Parse<'t> for Expression {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
-        parser.parse::<Equality>().map(|e| e.map(Self::from))
+        let Some(expression) = parser.parse::<Equality>()? else {
+            return Ok(None);
+        };
+        if parser.consume(&Token::Equal).is_err() {
+            return Ok(Some(Self::Equality(expression)));
+        };
+        let Some(lvalue) = expression.lvalue() else {
+            return Err(Error::InvalidLValue(Self::Equality(expression).to_string()));
+        };
+        let Some(expression) = parser.parse()? else {
+            return Err(parser.unexpected());
+        };
+        Ok(Some(Self::Assignment(Assignment {
+            lvalue,
+            expression: Box::new(expression),
+        })))
     }
 }
 
@@ -202,7 +219,7 @@ impl<'t> Parse<'t> for Primary {
             return Ok(Some(primary.into()));
         }
         if let Some(identifier) = parser.consume_identifier() {
-            return Ok(Some(Self::Identifier(identifier.into())));
+            return Ok(Some(Self::Identifier(identifier)));
         }
         let Some((
             &SourceToken {
@@ -320,6 +337,7 @@ pub enum Error<'t> {
     UnmatchedParen(usize),
     UnexpectedEndOfInput,
     UnterminatedPrint(usize),
+    InvalidLValue(String),
 }
 
 impl fmt::Display for Error<'_> {
@@ -333,6 +351,7 @@ impl fmt::Display for Error<'_> {
             Error::UnterminatedPrint(line) => {
                 write!(f, "Unterminated print statement on line {line}")
             }
+            Error::InvalidLValue(string) => write!(f, "Invalid l-value: {string}"),
         }
     }
 }

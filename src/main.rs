@@ -71,4 +71,13 @@ mod tests {
         let output = interpreter.collect_output(source).unwrap();
         assert_eq!(output, vec!["3"]);
     }
+
+    #[test]
+    fn test_8_4_1() {
+        let mut interpreter = Interpreter::new();
+
+        let source = "var a = \"before\"; a = \"value\"; print a;";
+        let output = interpreter.collect_output(source).unwrap();
+        assert_eq!(output, vec!["\"value\""]);
+    }
 }

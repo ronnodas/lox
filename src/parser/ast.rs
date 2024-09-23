@@ -3,6 +3,7 @@ use std::error;
 use std::rc::Rc;
 
 pub type Identifier = Rc<str>;
+pub type LValue = Identifier;
 
 pub enum Declaration {
     VariableDeclaration {
@@ -18,7 +19,13 @@ pub enum Statement {
 }
 
 pub enum Expression {
+    Assignment(Assignment),
     Equality(Equality),
+}
+
+pub struct Assignment {
+    pub lvalue: LValue,
+    pub expression: Box<Expression>,
 }
 
 // TODO: could make the two operands different types, is that useful anywhere?
@@ -175,34 +182,6 @@ impl fmt::Display for TypeError {
     }
 }
 
-impl fmt::Display for ComparisonOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Greater => write!(f, ">"),
-            Self::GreaterEqual => write!(f, ">="),
-            Self::Less => write!(f, "<"),
-            Self::LessEqual => write!(f, "<="),
-        }
-    }
-}
-
-impl fmt::Display for SumOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Plus => write!(f, "+"),
-            Self::Minus => write!(f, "-"),
-        }
-    }
-}
-
-impl fmt::Display for FactorOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Divide => write!(f, "/"),
-            Self::Multiply => write!(f, "*"),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum TypeError {
@@ -231,6 +210,7 @@ pub trait ExpressionVisitor {
     type Error;
 
     fn visit_expression(&mut self, expression: &Expression) -> Result<Self::Output, Self::Error>;
+    fn visit_assignment(&mut self, assignment: &Assignment) -> Result<Self::Output, Self::Error>;
     fn visit_unary(&mut self, unary: &Unary) -> Result<Self::Output, Self::Error>;
     fn visit_primary(&mut self, primary: &Primary) -> Result<Self::Output, Self::Error>;
 }
@@ -300,6 +280,12 @@ pub trait ExpressionHost<V: ExpressionVisitor> {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
 }
 
+impl<V: ExpressionVisitor> ExpressionHost<V> for Assignment {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        visitor.visit_assignment(self)
+    }
+}
+
 impl<V: ExpressionVisitor> ExpressionHost<V> for Expression {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_expression(self)
@@ -309,6 +295,12 @@ impl<V: ExpressionVisitor> ExpressionHost<V> for Expression {
 impl<V: ExpressionVisitor> ExpressionHost<V> for Unary {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_unary(self)
+    }
+}
+
+impl<V: ExpressionVisitor> ExpressionHost<V> for Primary {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        visitor.visit_primary(self)
     }
 }
 
@@ -344,6 +336,44 @@ impl fmt::Display for Value {
             Self::String(string) => write!(f, "\"{string}\""),
             Self::Boolean(boolean) => write!(f, "{boolean}"),
             Self::Nil => write!(f, "nil"),
+        }
+    }
+}
+
+pub trait IntoLValue {
+    fn lvalue(&self) -> Option<LValue>;
+}
+
+impl IntoLValue for Expression {
+    fn lvalue(&self) -> Option<LValue> {
+        match self {
+            Self::Assignment(_) => None,
+            Self::Equality(equality) => equality.lvalue(),
+        }
+    }
+}
+
+impl<T: IntoLValue, Op> IntoLValue for Fold<T, Op> {
+    fn lvalue(&self) -> Option<LValue> {
+        self.more.is_empty().then(|| self.start.lvalue()).flatten()
+    }
+}
+
+impl IntoLValue for Unary {
+    fn lvalue(&self) -> Option<LValue> {
+        match self {
+            Self::Unary(..) => None,
+            Self::Primary(primary) => primary.lvalue(),
+        }
+    }
+}
+
+impl IntoLValue for Primary {
+    fn lvalue(&self) -> Option<LValue> {
+        match self {
+            Self::Identifier(identifier) => Some(Identifier::clone(identifier)),
+            Self::Grouping(expression) => expression.lvalue(),
+            Self::Literal(_) => None,
         }
     }
 }

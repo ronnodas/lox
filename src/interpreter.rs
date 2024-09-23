@@ -6,9 +6,9 @@ use std::{error, fmt, io};
 use anyhow::Context as _;
 
 use crate::parser::ast::{
-    BinaryOperator, ComparisonOperator, Declaration, EqualityOperator, Expression, ExpressionHost,
-    ExpressionVisitor, FactorOperator, Identifier, Primary, StatementHost as _, StatementVisitor,
-    SumOperator, TypeError, Unary, Value,
+    Assignment, BinaryOperator, ComparisonOperator, Declaration, EqualityOperator, Expression,
+    ExpressionHost, ExpressionVisitor, FactorOperator, Identifier, Primary, StatementHost as _,
+    StatementVisitor, SumOperator, TypeError, Unary, Value,
 };
 use crate::parser::Parser;
 use crate::tokenizer::Tokenizer;
@@ -56,6 +56,7 @@ impl ExpressionVisitor for Interpreter {
 
     fn visit_expression(&mut self, expression: &Expression) -> Result<Self::Output, Self::Error> {
         match expression {
+            Expression::Assignment(assignment) => assignment.host(self),
             Expression::Equality(equality) => equality.host(self),
         }
     }
@@ -79,6 +80,12 @@ impl ExpressionVisitor for Interpreter {
                 .get(identifier)
                 .ok_or_else(|| Error::UndeclaredVariable(Identifier::clone(identifier))),
         }
+    }
+
+    fn visit_assignment(&mut self, assignment: &Assignment) -> Result<Self::Output, Self::Error> {
+        let value = assignment.expression.host(self)?;
+        self.environment.set(&assignment.lvalue, value.clone());
+        Ok(value)
     }
 }
 
