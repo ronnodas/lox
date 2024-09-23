@@ -12,7 +12,14 @@ impl Environment {
         self.variables.get(identifier).cloned()
     }
 
-    pub fn set(&mut self, identifier: &str, value: Value) {
-        _ = self.variables.insert(identifier.into(), value);
+    #[must_use]
+    pub fn set(&mut self, identifier: &Identifier, value: Value) -> Option<()> {
+        self.variables.get_mut(identifier).map(|v| *v = value)
+    }
+
+    pub fn declare(&mut self, identifier: &str, value: Option<Value>) {
+        _ = self
+            .variables
+            .insert(identifier.into(), value.unwrap_or(Value::Nil));
     }
 }

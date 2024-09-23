@@ -80,4 +80,12 @@ mod tests {
         let output = interpreter.collect_output(source).unwrap();
         assert_eq!(output, vec!["\"value\""]);
     }
+
+    #[test]
+    fn test_8_4_2() {
+        let mut interpreter = Interpreter::new();
+        let source = "var a = 1; print a = 2;";
+        let output = interpreter.collect_output(source).unwrap();
+        assert_eq!(output, vec!["2"]);
+    }
 }

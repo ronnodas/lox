@@ -43,9 +43,8 @@ impl StatementVisitor for Interpreter {
     ) -> Result<Self::Output, Self::Error> {
         let value = initializer
             .map(|expression| self.visit_expression(expression))
-            .transpose()?
-            .unwrap_or(Value::Nil);
-        self.environment.set(identifier, value);
+            .transpose()?;
+        self.environment.declare(identifier, value);
         Ok(None)
     }
 }
@@ -84,7 +83,10 @@ impl ExpressionVisitor for Interpreter {
 
     fn visit_assignment(&mut self, assignment: &Assignment) -> Result<Self::Output, Self::Error> {
         let value = assignment.expression.host(self)?;
-        self.environment.set(&assignment.lvalue, value.clone());
+        let Some(()) = self.environment.set(&assignment.lvalue, value.clone()) else {
+            let identifier = Identifier::clone(&assignment.lvalue);
+            return Err(Error::UndeclaredVariable(identifier));
+        };
         Ok(value)
     }
 }
