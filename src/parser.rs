@@ -5,9 +5,9 @@ use std::iter::from_fn;
 use std::{error, fmt};
 
 use ast::{
-    Assignment, ComparisonOperator, Declaration, Equality, EqualityOperator, Expression,
-    FactorOperator, Fold, Identifier, IntoLValue as _, Primary, Statement, SumOperator, Unary,
-    UnaryOperator, Value,
+    AndOperator, Assignment, ComparisonOperator, Declaration, EqualityOperator, Expression,
+    FactorOperator, Fold, Identifier, IntoLValue as _, LogicalOr, OrOperator, Primary, Statement,
+    SumOperator, Unary, UnaryOperator, Value,
 };
 use itertools::Itertools as _;
 
@@ -204,14 +204,14 @@ impl<'t> Parse<'t> for Statement {
 
 impl<'t> Parse<'t> for Expression {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
-        let Some(expression) = parser.parse::<Equality>()? else {
+        let Some(expression) = parser.parse::<LogicalOr>()? else {
             return Ok(None);
         };
         if parser.consume(&Token::Equal).is_err() {
-            return Ok(Some(Self::Equality(expression)));
+            return Ok(Some(Self::Or(expression)));
         };
         let Some(lvalue) = expression.lvalue() else {
-            return Err(Error::InvalidLValue(Self::Equality(expression).to_string()));
+            return Err(Error::InvalidLValue(Self::Or(expression).to_string()));
         };
         let Some(expression) = parser.parse()? else {
             return Err(parser.unexpected());
@@ -298,6 +298,18 @@ impl<'t> Parse<'t> for Primary {
 
 pub trait MatchToken<'t>: Sized {
     fn match_token(token: Token<'t>) -> Option<Self>;
+}
+
+impl<'t> MatchToken<'t> for OrOperator {
+    fn match_token(token: Token) -> Option<Self> {
+        (token == Token::Or).then_some(Self)
+    }
+}
+
+impl<'t> MatchToken<'t> for AndOperator {
+    fn match_token(token: Token) -> Option<Self> {
+        (token == Token::And).then_some(Self)
+    }
 }
 
 #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]

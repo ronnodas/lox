@@ -1,8 +1,8 @@
 use std::fmt::{self, Display};
 
 use super::ast::{
-    Assignment, ComparisonOperator, EqualityOperator, Expression, ExpressionHost,
-    ExpressionVisitor, FactorOperator, Fold, Primary, SumOperator, Unary, UnaryOperator,
+    Assignment, Expression, ExpressionHost, ExpressionVisitCombiner, ExpressionVisitor, Fold,
+    Primary, Unary,
 };
 
 struct Printer<'a, 'f> {
@@ -16,7 +16,7 @@ impl<'a, 'f> ExpressionVisitor for Printer<'a, 'f> {
     fn visit_expression(&mut self, expression: &Expression) -> fmt::Result {
         match expression {
             Expression::Assignment(assignment) => assignment.host(self),
-            Expression::Equality(equality) => equality.fmt(self.formatter),
+            Expression::Or(or) => or.fmt(self.formatter),
         }
     }
 
@@ -49,64 +49,29 @@ impl Display for Expression {
     }
 }
 
-impl<T: Display, Op: Display> Display for Fold<T, Op> {
+impl<T, Op> Display for Fold<T, Op>
+where
+    for<'a, 'f> T: Display + ExpressionHost<Printer<'a, 'f>>,
+    for<'a, 'f> Op: Display + ExpressionVisitCombiner<Printer<'a, 'f>, T>,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.start.fmt(f)?;
-        self.more
-            .iter()
-            .try_for_each(|(op, right)| write!(f, " {op} {right}"))
+        self.host(&mut (Printer { formatter: f }))
+    }
+}
+
+impl<'a, 'f, T: Display + ExpressionHost<Printer<'a, 'f>>, Op: Display>
+    ExpressionVisitCombiner<Printer<'a, 'f>, T> for Op
+{
+    type Output = ();
+    type Error = fmt::Error;
+
+    fn combine(&self, (): (), visitor: &mut Printer, rhs: &T) -> fmt::Result {
+        write!(visitor.formatter, " {self} {rhs}")
     }
 }
 
 impl Display for Unary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.host(&mut (Printer { formatter: f }))
-    }
-}
-
-impl Display for EqualityOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Equal => write!(f, "=="),
-            Self::NotEqual => write!(f, "!="),
-        }
-    }
-}
-
-impl Display for ComparisonOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Greater => write!(f, ">"),
-            Self::GreaterEqual => write!(f, ">="),
-            Self::Less => write!(f, "<"),
-            Self::LessEqual => write!(f, "<="),
-        }
-    }
-}
-
-impl Display for SumOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Plus => write!(f, "+"),
-            Self::Minus => write!(f, "-"),
-        }
-    }
-}
-
-impl Display for FactorOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Divide => write!(f, "/"),
-            Self::Multiply => write!(f, "*"),
-        }
-    }
-}
-
-impl Display for UnaryOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Minus => write!(f, "-"),
-            Self::Not => write!(f, "!"),
-        }
     }
 }

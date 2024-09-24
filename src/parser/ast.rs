@@ -29,7 +29,7 @@ pub enum Statement {
 #[derive(Debug)]
 pub enum Expression {
     Assignment(Assignment),
-    Equality(Equality),
+    Or(LogicalOr),
 }
 
 #[derive(Debug)]
@@ -45,6 +45,8 @@ pub struct Fold<T, Op> {
     pub more: Vec<(Op, T)>,
 }
 
+pub type LogicalOr = Fold<LogicalAnd, OrOperator>;
+pub type LogicalAnd = Fold<Equality, AndOperator>;
 pub type Equality = Fold<Comparison, EqualityOperator>;
 pub type Comparison = Fold<Sum, ComparisonOperator>;
 pub type Sum = Fold<Factor, SumOperator>;
@@ -70,6 +72,11 @@ pub enum Value {
     Boolean(bool),
     Nil,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct OrOperator;
+#[derive(Debug, Clone, Copy)]
+pub struct AndOperator;
 
 #[derive(Clone, Copy, Debug)]
 pub enum EqualityOperator {
@@ -211,9 +218,9 @@ impl Primary {
     }
 }
 
-impl From<Equality> for Expression {
-    fn from(v: Equality) -> Self {
-        Self::Equality(v)
+impl From<LogicalOr> for Expression {
+    fn from(v: LogicalOr) -> Self {
+        Self::Or(v)
     }
 }
 
@@ -225,6 +232,34 @@ pub trait ExpressionVisitor {
     fn visit_assignment(&mut self, assignment: &Assignment) -> Result<Self::Output, Self::Error>;
     fn visit_unary(&mut self, unary: &Unary) -> Result<Self::Output, Self::Error>;
     fn visit_primary(&mut self, primary: &Primary) -> Result<Self::Output, Self::Error>;
+    fn visit_fold<T: ExpressionHost<Self>, Op: ExpressionVisitCombiner<Self, T>>(
+        &mut self,
+        fold: &Fold<T, Op>,
+    ) -> Result<Self::Output, Self::Error> {
+        let start = fold.start.host(self)?;
+        fold.more
+            .iter()
+            .try_fold(start, |lhs, (op, rhs)| {
+                op.combine(lhs, self, rhs).map(Op::Output::into)
+            })
+            .map_err(Op::Error::into)
+    }
+}
+
+pub trait ExpressionHost<V: ExpressionVisitor + ?Sized> {
+    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
+}
+
+pub trait ExpressionVisitCombiner<V: ExpressionVisitor + ?Sized, T: ExpressionHost<V>> {
+    type Output: Into<V::Output>;
+    type Error: Into<V::Error>;
+
+    fn combine(
+        &self,
+        lhs: V::Output,
+        visitor: &mut V,
+        rhs: &T,
+    ) -> Result<Self::Output, Self::Error>;
 }
 
 pub trait StatementVisitor {
@@ -296,17 +331,6 @@ impl<V: StatementVisitor> StatementHost<V> for Statement {
     }
 }
 
-pub trait BinaryOperator<I> {
-    type Output;
-    type Error;
-
-    fn evaluate(self, lhs: I, rhs: I) -> Result<Self::Output, Self::Error>;
-}
-
-pub trait ExpressionHost<V: ExpressionVisitor> {
-    fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error>;
-}
-
 impl<V: ExpressionVisitor> ExpressionHost<V> for Assignment {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit_assignment(self)
@@ -331,21 +355,11 @@ impl<V: ExpressionVisitor> ExpressionHost<V> for Primary {
     }
 }
 
-impl<V, T, Op> ExpressionHost<V> for Fold<T, Op>
-where
-    V: ExpressionVisitor,
-    T: ExpressionHost<V>,
-    Op: BinaryOperator<V::Output, Output: Into<V::Output>, Error: Into<V::Error>> + Copy,
+impl<V: ExpressionVisitor, T: ExpressionHost<V>, Op: ExpressionVisitCombiner<V, T>>
+    ExpressionHost<V> for Fold<T, Op>
 {
     fn host(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
-        let Self { start, more } = self;
-        let start = start.host(visitor)?;
-        more.iter().try_fold(start, |lhs, (op, rhs)| {
-            let rhs = rhs.host(visitor)?;
-            op.evaluate(lhs, rhs)
-                .map(Op::Output::into)
-                .map_err(Op::Error::into)
-        })
+        visitor.visit_fold(self)
     }
 }
 
@@ -375,7 +389,7 @@ impl IntoLValue for Expression {
     fn lvalue(&self) -> Option<LValue> {
         match self {
             Self::Assignment(_) => None,
-            Self::Equality(equality) => equality.lvalue(),
+            Self::Or(or) => or.lvalue(),
         }
     }
 }
@@ -401,6 +415,65 @@ impl IntoLValue for Primary {
             Self::Identifier(identifier) => Some(Identifier::clone(identifier)),
             Self::Grouping(expression) => expression.lvalue(),
             Self::Literal(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for OrOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "or")
+    }
+}
+
+impl fmt::Display for AndOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "and")
+    }
+}
+
+impl fmt::Display for EqualityOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Equal => write!(f, "=="),
+            Self::NotEqual => write!(f, "!="),
+        }
+    }
+}
+
+impl fmt::Display for ComparisonOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Greater => write!(f, ">"),
+            Self::GreaterEqual => write!(f, ">="),
+            Self::Less => write!(f, "<"),
+            Self::LessEqual => write!(f, "<="),
+        }
+    }
+}
+
+impl fmt::Display for SumOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plus => write!(f, "+"),
+            Self::Minus => write!(f, "-"),
+        }
+    }
+}
+
+impl fmt::Display for FactorOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Divide => write!(f, "/"),
+            Self::Multiply => write!(f, "*"),
+        }
+    }
+}
+
+impl fmt::Display for UnaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Minus => write!(f, "-"),
+            Self::Not => write!(f, "!"),
         }
     }
 }

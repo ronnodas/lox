@@ -123,4 +123,13 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_9_3() {
+        let mut interpreter = Interpreter::new();
+
+        let source = "print \"hi\" or 2; print nil or \"yes\";";
+        let output = interpreter.run(source).unwrap();
+        assert_eq!(output, vec!["\"hi\"", "\"yes\""]);
+    }
 }

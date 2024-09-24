@@ -7,9 +7,10 @@ use anyhow::Context as _;
 use itertools::Itertools as _;
 
 use crate::parser::ast::{
-    Assignment, BinaryOperator, ComparisonOperator, Declaration, EqualityOperator, Expression,
-    ExpressionHost, ExpressionVisitor, FactorOperator, Identifier, Primary, Statement,
-    StatementHost as _, StatementVisitor, SumOperator, TypeError, Unary, Value,
+    AndOperator, Assignment, Comparison, ComparisonOperator, Declaration, Equality,
+    EqualityOperator, Expression, ExpressionHost, ExpressionVisitCombiner, ExpressionVisitor,
+    Factor, FactorOperator, Identifier, LogicalAnd, OrOperator, Primary, Statement,
+    StatementHost as _, StatementVisitor, Sum, SumOperator, TypeError, Unary, Value,
 };
 use crate::parser::{Error as ParseError, Parser};
 use crate::tokenizer::{Error as TokenError, Tokenizer};
@@ -84,7 +85,7 @@ impl ExpressionVisitor for Interpreter {
     fn visit_expression(&mut self, expression: &Expression) -> Result<Self::Output, Self::Error> {
         match expression {
             Expression::Assignment(assignment) => assignment.host(self),
-            Expression::Equality(equality) => equality.host(self),
+            Expression::Or(or) => or.host(self),
         }
     }
 
@@ -156,8 +157,9 @@ impl Interpreter {
     ) -> anyhow::Result<()> {
         // TODO QoL:
         // * implicit print
-        // * add semicolons
         // * multiline input
+        // * multiline output
+        // * arrow keys
 
         loop {
             output.write_all(b"> ")?;
@@ -165,7 +167,7 @@ impl Interpreter {
             let Some(line) = input.next() else {
                 break;
             };
-            let line = line.context("Failed to read line from input")?;
+            let line = line.context("Failed to read line from input")? + ";";
 
             match self.run(&line) {
                 Ok(print) => {
@@ -242,7 +244,118 @@ impl fmt::Display for RuntimeError {
 
 impl error::Error for RuntimeError {}
 
-impl BinaryOperator<Value> for EqualityOperator {
+pub trait BinaryOperator<T: ExpressionHost<Interpreter>>: Copy {
+    type Output: Into<Value>;
+    type Error: Into<RuntimeError>;
+
+    fn evaluate(self, lhs: Value, rhs: Value) -> Result<Self::Output, Self::Error>;
+
+    fn eager_combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &T,
+    ) -> Result<Value, RuntimeError> {
+        let rhs = rhs.host(visitor)?;
+        self.evaluate(lhs, rhs)
+            .map_err(Self::Error::into)
+            .map(Self::Output::into)
+    }
+
+    fn short_circuit_combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &T,
+    ) -> Result<Value, RuntimeError>
+    where
+        Self: ShortCircuitingOperator,
+    {
+        if self.short_circuit(&lhs) {
+            Ok(lhs)
+        } else {
+            rhs.host(visitor)
+        }
+    }
+}
+
+pub trait ShortCircuitingOperator {
+    fn short_circuit(&self, lhs: &Value) -> bool;
+}
+
+impl BinaryOperator<LogicalAnd> for OrOperator {
+    type Output = Value;
+    type Error = Infallible;
+
+    fn evaluate(self, lhs: Value, rhs: Value) -> Result<Self::Output, Self::Error> {
+        Ok(if lhs.is_truthy() { lhs } else { rhs })
+    }
+}
+
+impl ExpressionVisitCombiner<Interpreter, LogicalAnd> for OrOperator {
+    type Output = Value;
+    type Error = RuntimeError;
+
+    fn combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &LogicalAnd,
+    ) -> Result<Self::Output, Self::Error> {
+        self.short_circuit_combine(lhs, visitor, rhs)
+    }
+}
+
+impl ShortCircuitingOperator for OrOperator {
+    fn short_circuit(&self, lhs: &Value) -> bool {
+        lhs.is_truthy()
+    }
+}
+
+impl BinaryOperator<Equality> for AndOperator {
+    type Output = Value;
+    type Error = Infallible;
+
+    fn evaluate(self, lhs: Value, rhs: Value) -> Result<Self::Output, Self::Error> {
+        Ok(if lhs.is_truthy() { rhs } else { lhs })
+    }
+}
+
+impl ExpressionVisitCombiner<Interpreter, Equality> for AndOperator {
+    type Output = Value;
+    type Error = RuntimeError;
+
+    fn combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &Equality,
+    ) -> Result<Self::Output, Self::Error> {
+        self.short_circuit_combine(lhs, visitor, rhs)
+    }
+}
+
+impl ShortCircuitingOperator for AndOperator {
+    fn short_circuit(&self, lhs: &Value) -> bool {
+        !lhs.is_truthy()
+    }
+}
+
+impl ExpressionVisitCombiner<Interpreter, Comparison> for EqualityOperator {
+    type Output = Value;
+    type Error = RuntimeError;
+
+    fn combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &Comparison,
+    ) -> Result<Self::Output, Self::Error> {
+        self.eager_combine(lhs, visitor, rhs)
+    }
+}
+
+impl BinaryOperator<Comparison> for EqualityOperator {
     type Output = bool;
     type Error = Infallible;
 
@@ -262,7 +375,21 @@ impl BinaryOperator<Value> for EqualityOperator {
     }
 }
 
-impl BinaryOperator<Value> for ComparisonOperator {
+impl ExpressionVisitCombiner<Interpreter, Sum> for ComparisonOperator {
+    type Output = Value;
+    type Error = RuntimeError;
+
+    fn combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &Sum,
+    ) -> Result<Self::Output, Self::Error> {
+        self.eager_combine(lhs, visitor, rhs)
+    }
+}
+
+impl BinaryOperator<Sum> for ComparisonOperator {
     type Output = bool;
     type Error = TypeError;
 
@@ -278,7 +405,21 @@ impl BinaryOperator<Value> for ComparisonOperator {
     }
 }
 
-impl BinaryOperator<Value> for SumOperator {
+impl ExpressionVisitCombiner<Interpreter, Factor> for SumOperator {
+    type Output = Value;
+    type Error = RuntimeError;
+
+    fn combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &Factor,
+    ) -> Result<Self::Output, Self::Error> {
+        self.eager_combine(lhs, visitor, rhs)
+    }
+}
+
+impl BinaryOperator<Factor> for SumOperator {
     type Output = Value;
     type Error = TypeError;
 
@@ -296,7 +437,21 @@ impl BinaryOperator<Value> for SumOperator {
     }
 }
 
-impl BinaryOperator<Value> for FactorOperator {
+impl ExpressionVisitCombiner<Interpreter, Unary> for FactorOperator {
+    type Output = Value;
+    type Error = RuntimeError;
+
+    fn combine(
+        &self,
+        lhs: Value,
+        visitor: &mut Interpreter,
+        rhs: &Unary,
+    ) -> Result<Self::Output, Self::Error> {
+        self.eager_combine(lhs, visitor, rhs)
+    }
+}
+
+impl BinaryOperator<Unary> for FactorOperator {
     type Output = f64;
     type Error = TypeError;
 
