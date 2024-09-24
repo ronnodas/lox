@@ -22,6 +22,10 @@ pub enum Statement {
         then_branch: Box<Statement>,
         else_branch: Option<Box<Statement>>,
     },
+    While {
+        condition: Expression,
+        body: Box<Statement>,
+    },
     Print(Expression),
     Block(Vec<Declaration>),
 }
@@ -146,6 +150,12 @@ impl UnaryOperator {
     }
 }
 
+impl From<Statement> for Declaration {
+    fn from(v: Statement) -> Self {
+        Self::Statement(v)
+    }
+}
+
 impl From<Value> for Primary {
     fn from(v: Value) -> Self {
         Self::Literal(v)
@@ -161,6 +171,69 @@ impl From<f64> for Value {
 impl From<bool> for Value {
     fn from(v: bool) -> Self {
         Self::Boolean(v)
+    }
+}
+
+impl From<LogicalOr> for Expression {
+    fn from(v: LogicalOr) -> Self {
+        Self::Or(v)
+    }
+}
+
+impl<T, Op> From<T> for Fold<T, Op> {
+    fn from(v: T) -> Self {
+        Self {
+            start: v,
+            more: Vec::new(),
+        }
+    }
+}
+
+impl From<LogicalAnd> for Expression {
+    fn from(v: LogicalAnd) -> Self {
+        LogicalOr::from(v).into()
+    }
+}
+
+impl From<Equality> for Expression {
+    fn from(v: Equality) -> Self {
+        LogicalAnd::from(v).into()
+    }
+}
+
+impl From<Comparison> for Expression {
+    fn from(v: Comparison) -> Self {
+        Equality::from(v).into()
+    }
+}
+
+impl From<Sum> for Expression {
+    fn from(v: Sum) -> Self {
+        Comparison::from(v).into()
+    }
+}
+
+impl From<Factor> for Expression {
+    fn from(v: Factor) -> Self {
+        Sum::from(v).into()
+    }
+}
+
+impl From<Unary> for Expression {
+    fn from(v: Unary) -> Self {
+        Factor::from(v).into()
+    }
+}
+
+impl From<Primary> for Expression {
+    fn from(v: Primary) -> Self {
+        Unary::from(v).into()
+    }
+}
+
+impl From<Value> for Expression {
+    fn from(v: Value) -> Self {
+        Primary::from(v).into()
     }
 }
 
@@ -215,12 +288,6 @@ impl error::Error for TypeError {}
 impl Primary {
     pub(crate) fn group(expression: Expression) -> Self {
         Self::Grouping(Box::new(expression))
-    }
-}
-
-impl From<LogicalOr> for Expression {
-    fn from(v: LogicalOr) -> Self {
-        Self::Or(v)
     }
 }
 
@@ -286,6 +353,12 @@ pub trait StatementVisitor {
         else_branch: Option<&Statement>,
     ) -> Result<Self::Output, Self::Error>;
 
+    fn visit_while(
+        &mut self,
+        condition: &Expression,
+        body: &Statement,
+    ) -> Result<Self::Output, Self::Error>;
+
     fn visit_block(&mut self, block: &[Declaration]) -> Result<Self::Output, Self::Error>;
 
     fn visit_statement(&mut self, statement: &Statement) -> Result<Self::Output, Self::Error> {
@@ -298,6 +371,7 @@ pub trait StatementVisitor {
                 then_branch,
                 else_branch,
             } => self.visit_if(condition, then_branch, else_branch.as_deref()),
+            Statement::While { condition, body } => self.visit_while(condition, body),
         }
     }
 

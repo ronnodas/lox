@@ -171,6 +171,77 @@ impl<'t, 'p> Parser<'p, 't> {
             else_branch,
         }))
     }
+
+    fn while_statement(&mut self) -> Result<Option<Statement>, Error<'t>> {
+        if self.consume(&Token::While).is_err() {
+            return Ok(None);
+        }
+        _ = self.consume(&Token::LeftParen)?;
+        let Some(condition) = self.parse()? else {
+            return Err(self.unexpected());
+        };
+        _ = self.consume(&Token::RightParen)?;
+        let Some(body) = self.parse()? else {
+            return Err(self.unexpected());
+        };
+        Ok(Some(Statement::While {
+            condition,
+            body: Box::new(body),
+        }))
+    }
+
+    fn for_statement(&mut self) -> Result<Option<Statement>, Error<'t>> {
+        if self.consume(&Token::For).is_err() {
+            return Ok(None);
+        }
+        _ = self.consume(&Token::LeftParen)?;
+        let initializer = self.parse()?;
+        if initializer.is_none() {
+            _ = self.consume(&Token::Semicolon)?;
+        }
+        let condition = self.parse()?;
+        _ = self.consume(&Token::Semicolon)?;
+        let increment = self.parse()?;
+        _ = self.consume(&Token::RightParen)?;
+        let Some(body) = self.parse()? else {
+            return Err(self.unexpected());
+        };
+        Ok(Some(desugar_for(initializer, condition, increment, body)))
+    }
+}
+
+fn desugar_for(
+    initializer: Option<ForInitializer>,
+    condition: Option<Expression>,
+    increment: Option<Expression>,
+    body: Statement,
+) -> Statement {
+    let body = Box::new(match increment {
+        Some(increment) => {
+            Statement::Block(vec![body.into(), Statement::Expression(increment).into()])
+        }
+        None => body,
+    });
+    let condition = condition.unwrap_or_else(|| Value::Boolean(true).into());
+    let body = Statement::While { condition, body };
+    match initializer {
+        Some(initializer) => Statement::Block(vec![initializer.into(), body.into()]),
+        None => body,
+    }
+}
+
+enum ForInitializer {
+    Declaration(Declaration),
+    Expression(Expression),
+}
+
+impl From<ForInitializer> for Declaration {
+    fn from(initializer: ForInitializer) -> Self {
+        match initializer {
+            ForInitializer::Declaration(declaration) => declaration,
+            ForInitializer::Expression(expression) => Statement::Expression(expression).into(),
+        }
+    }
 }
 
 pub trait Parse<'t>: Sized {
@@ -195,6 +266,10 @@ impl<'t> Parse<'t> for Statement {
         } else if let statement @ Some(_) = parser.block()? {
             Ok(statement)
         } else if let statement @ Some(_) = parser.if_statement()? {
+            Ok(statement)
+        } else if let statement @ Some(_) = parser.while_statement()? {
+            Ok(statement)
+        } else if let statement @ Some(_) = parser.for_statement()? {
             Ok(statement)
         } else {
             parser.expression_statement()
@@ -292,6 +367,18 @@ impl<'t> Parse<'t> for Primary {
                 Ok(Some(Self::group(expression)))
             }
             Some((&token, _)) => Err(Error::UnexpectedToken(token)),
+        }
+    }
+}
+
+impl<'t> Parse<'t> for ForInitializer {
+    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
+        if let Some(initializer) = parser.variable_declaration()? {
+            Ok(Some(Self::Declaration(initializer)))
+        } else if let Some(expression) = parser.parse()? {
+            Ok(Some(Self::Expression(expression)))
+        } else {
+            Ok(None)
         }
     }
 }

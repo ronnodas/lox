@@ -132,4 +132,17 @@ mod tests {
         let output = interpreter.run(source).unwrap();
         assert_eq!(output, vec!["\"hi\"", "\"yes\""]);
     }
+
+    #[test]
+    fn test_9_5() {
+        let mut interpreter = Interpreter::new();
+
+        let source = "var a = 0; var temp; for (var b = 1; a < 10000; b = temp + b) { print a; temp = a; a = b; }";
+        let output = interpreter.run(source).unwrap();
+        let expected_output = [
+            "0", "1", "1", "2", "3", "5", "8", "13", "21", "34", "55", "89", "144", "233", "377",
+            "610", "987", "1597", "2584", "4181", "6765",
+        ];
+        assert_eq!(output, expected_output);
+    }
 }

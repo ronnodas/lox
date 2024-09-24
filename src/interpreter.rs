@@ -76,6 +76,18 @@ impl StatementVisitor for Interpreter {
             Ok(vec![])
         }
     }
+
+    fn visit_while(
+        &mut self,
+        condition: &Expression,
+        body: &Statement,
+    ) -> Result<Self::Output, Self::Error> {
+        let mut outputs = vec![];
+        while condition.host(self)?.is_truthy() {
+            outputs.extend(body.host(self)?);
+        }
+        Ok(outputs)
+    }
 }
 
 impl ExpressionVisitor for Interpreter {
