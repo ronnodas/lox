@@ -17,6 +17,11 @@ pub enum Declaration {
 #[derive(Debug)]
 pub enum Statement {
     Expression(Expression),
+    If {
+        condition: Expression,
+        then_branch: Box<Statement>,
+        else_branch: Option<Box<Statement>>,
+    },
     Print(Expression),
     Block(Vec<Declaration>),
 }
@@ -129,7 +134,7 @@ impl UnaryOperator {
                 let value = value.float().ok_or(TypeError::UnaryMinus(value))?;
                 Ok(Value::Number(-value))
             }
-            Self::Not => Ok(Value::Boolean(!value.boolean())),
+            Self::Not => Ok(Value::Boolean(!value.is_truthy())),
         }
     }
 }
@@ -161,7 +166,7 @@ impl Value {
         }
     }
 
-    const fn boolean(&self) -> bool {
+    pub const fn is_truthy(&self) -> bool {
         match self {
             &Self::Boolean(boolean) => boolean,
             Self::Nil => false,
@@ -239,6 +244,13 @@ pub trait StatementVisitor {
         initializer: Option<&Expression>,
     ) -> Result<Self::Output, Self::Error>;
 
+    fn visit_if(
+        &mut self,
+        condition: &Expression,
+        then_branch: &Statement,
+        else_branch: Option<&Statement>,
+    ) -> Result<Self::Output, Self::Error>;
+
     fn visit_block(&mut self, block: &[Declaration]) -> Result<Self::Output, Self::Error>;
 
     fn visit_statement(&mut self, statement: &Statement) -> Result<Self::Output, Self::Error> {
@@ -246,6 +258,11 @@ pub trait StatementVisitor {
             Statement::Expression(expression) => self.visit_expression_statement(expression),
             Statement::Print(expression) => self.visit_print(expression),
             Statement::Block(block) => self.visit_block(block),
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => self.visit_if(condition, then_branch, else_branch.as_deref()),
         }
     }
 

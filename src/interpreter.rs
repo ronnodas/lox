@@ -8,8 +8,8 @@ use itertools::Itertools as _;
 
 use crate::parser::ast::{
     Assignment, BinaryOperator, ComparisonOperator, Declaration, EqualityOperator, Expression,
-    ExpressionHost, ExpressionVisitor, FactorOperator, Identifier, Primary, StatementHost as _,
-    StatementVisitor, SumOperator, TypeError, Unary, Value,
+    ExpressionHost, ExpressionVisitor, FactorOperator, Identifier, Primary, Statement,
+    StatementHost as _, StatementVisitor, SumOperator, TypeError, Unary, Value,
 };
 use crate::parser::{Error as ParseError, Parser};
 use crate::tokenizer::{Error as TokenError, Tokenizer};
@@ -58,6 +58,22 @@ impl StatementVisitor for Interpreter {
             .collect();
         self.environment.pop();
         output
+    }
+
+    fn visit_if(
+        &mut self,
+        condition: &Expression,
+        then_branch: &Statement,
+        else_branch: Option<&Statement>,
+    ) -> Result<Self::Output, Self::Error> {
+        let condition = self.visit_expression(condition)?;
+        if condition.is_truthy() {
+            then_branch.host(self)
+        } else if let Some(else_branch) = else_branch {
+            else_branch.host(self)
+        } else {
+            Ok(vec![])
+        }
     }
 }
 

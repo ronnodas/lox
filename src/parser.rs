@@ -9,6 +9,7 @@ use ast::{
     FactorOperator, Fold, Identifier, IntoLValue as _, Primary, Statement, SumOperator, Unary,
     UnaryOperator, Value,
 };
+use itertools::Itertools as _;
 
 use crate::tokenizer::{SourceToken, Token};
 
@@ -54,25 +55,17 @@ impl<'t, 'p> Parser<'p, 't> {
         let Some(expression) = self.parse()? else {
             return Ok(None);
         };
-
-        match self.consume(&Token::Semicolon) {
-            // TODO use map
-            Ok(_) => Ok(Some(Statement::Expression(expression))),
-            Err(e) => Err(e),
-        }
+        _ = self.consume(&Token::Semicolon)?;
+        Ok(Some(Statement::Expression(expression)))
     }
 
     fn block(&mut self) -> Result<Option<Statement>, Error<'t>> {
-        match self.consume(&Token::LeftBrace) {
-            Ok(_) => {
-                let mut declarations = Vec::new();
-                while let Some(declaration) = self.parse()? {
-                    declarations.push(declaration);
-                }
-                self.consume(&Token::RightBrace)
-                    .map(|_| Some(Statement::Block(declarations)))
-            }
-            Err(_) => Ok(None),
+        if self.consume(&Token::LeftBrace).is_ok() {
+            let declarations = from_fn(|| self.parse().transpose()).try_collect()?;
+            _ = self.consume(&Token::RightBrace)?;
+            Ok(Some(Statement::Block(declarations)))
+        } else {
+            Ok(None)
         }
     }
 
@@ -132,24 +125,51 @@ impl<'t, 'p> Parser<'p, 't> {
     }
 
     fn variable_declaration(&mut self) -> Result<Option<Declaration>, Error<'t>> {
-        let Ok(_) = self.consume(&Token::Var) else {
+        if self.consume(&Token::Var).is_err() {
             return Ok(None);
         };
         let Some(Primary::Identifier(identifier)) = self.parse()? else {
             return Err(self.unexpected());
         };
-        let initializer = match self.consume(&Token::Equal) {
-            Ok(_) => self.parse()?,
-            Err(_) => None,
+        let initializer = if self.consume(&Token::Equal).is_ok() {
+            self.parse()?
+        } else {
+            None
         };
-        match self.consume(&Token::Semicolon) {
-            // TODO use map
-            Ok(_) => Ok(Some(Declaration::VariableDeclaration {
-                identifier,
-                initializer,
-            })),
-            Err(e) => Err(e),
+        _ = self.consume(&Token::Semicolon)?;
+        Ok(Some(Declaration::VariableDeclaration {
+            identifier,
+            initializer,
+        }))
+    }
+
+    fn if_statement(&mut self) -> Result<Option<Statement>, Error<'t>> {
+        if self.consume(&Token::If).is_err() {
+            return Ok(None);
         }
+        _ = self.consume(&Token::LeftParen)?;
+        let Some(condition) = self.parse()? else {
+            return Err(self.unexpected());
+        };
+        _ = self.consume(&Token::RightParen)?;
+        let Some(then_branch) = self.parse()? else {
+            return Err(self.unexpected());
+        };
+        let else_branch = if self.consume(&Token::Else).is_ok() {
+            if let Some(else_branch) = self.parse()? {
+                Some(Box::new(else_branch))
+            } else {
+                return Err(self.unexpected());
+            }
+        } else {
+            None
+        };
+
+        Ok(Some(Statement::If {
+            condition,
+            then_branch: Box::new(then_branch),
+            else_branch,
+        }))
     }
 }
 
@@ -161,21 +181,24 @@ pub trait Parse<'t>: Sized {
 impl<'t> Parse<'t> for Declaration {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
         if let declaration @ Some(_) = parser.variable_declaration()? {
-            return Ok(declaration);
+            Ok(declaration)
+        } else {
+            Ok(parser.parse()?.map(Self::Statement))
         }
-        Ok(parser.parse()?.map(Self::Statement))
     }
 }
 
 impl<'t> Parse<'t> for Statement {
     fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, Error<'t>> {
         if let statement @ Some(_) = parser.print_statement()? {
-            return Ok(statement);
+            Ok(statement)
+        } else if let statement @ Some(_) = parser.block()? {
+            Ok(statement)
+        } else if let statement @ Some(_) = parser.if_statement()? {
+            Ok(statement)
+        } else {
+            parser.expression_statement()
         }
-        if let statement @ Some(_) = parser.expression_statement()? {
-            return Ok(statement);
-        }
-        parser.block()
     }
 }
 
