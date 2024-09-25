@@ -5,10 +5,13 @@ mod tokenizer;
 use std::path::PathBuf;
 use std::{fs, io};
 
-use anyhow::Context as _;
 use clap::Parser as ArgParser;
+use miette::{Diagnostic, IntoDiagnostic as _};
+use parser::ParseError;
+use thiserror::Error;
 
-use interpreter::Interpreter;
+use interpreter::{Interpreter, RuntimeError};
+use tokenizer::Error as TokenError;
 
 #[derive(ArgParser, Debug)]
 #[command(version)]
@@ -16,11 +19,11 @@ struct Args {
     script_path: Option<PathBuf>,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> miette::Result<()> {
     let args = Args::parse();
     let mut interpreter = Interpreter::new();
     if let Some(script_path) = &args.script_path {
-        let script = fs::read_to_string(script_path).context("Failed to read file")?;
+        let script = fs::read_to_string(script_path).into_diagnostic()?;
         interpreter.run_and_print(&script);
     } else {
         interpreter.run_with_prompt(io::stdout(), io::stdin().lines())?;
@@ -28,9 +31,40 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Error, Debug, Diagnostic)]
+pub(crate) enum LoxError {
+    #[error("IO error")]
+    Io(
+        #[from]
+        #[source]
+        io::Error,
+    ),
+    #[error("Tokenizer error")]
+    #[diagnostic(transparent)]
+    Tokenizing(
+        #[from]
+        #[source]
+        TokenError,
+    ),
+    #[error("Parsing error")]
+    #[diagnostic(transparent)]
+    Parsing(
+        #[from]
+        #[source]
+        ParseError,
+    ),
+    #[error("Runtime error")]
+    #[diagnostic(transparent)]
+    Runtime(
+        #[from]
+        #[source]
+        RuntimeError,
+    ),
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Interpreter;
+    use super::{Interpreter, LoxError};
 
     #[test]
     fn test_8_1() {
@@ -91,15 +125,15 @@ mod tests {
 
     #[test]
     fn test_8_5() {
-        use crate::interpreter::{Error, RuntimeError};
+        use crate::interpreter::RuntimeError;
         let mut interpreter = Interpreter::new();
 
         let source = "{  var a = \"in block\"; } print a;";
-        let output = interpreter.run(source).unwrap_err();
-        assert_eq!(
-            output,
-            Error::Runtime(RuntimeError::UndeclaredVariable("a".into()))
-        );
+        let LoxError::Runtime(error) = interpreter.run(source).unwrap_err() else {
+            panic!()
+        };
+
+        assert_eq!(error, RuntimeError::UndeclaredVariable("a".into()));
     }
 
     #[test]

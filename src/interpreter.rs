@@ -1,19 +1,21 @@
 mod environment;
 
 use std::convert::Infallible;
-use std::{error, fmt, io};
+use std::{fmt, io};
 
-use anyhow::Context as _;
 use itertools::Itertools as _;
+use miette::Diagnostic;
+use thiserror::Error;
 
 use crate::parser::ast::{
     AndOperator, Assignment, Comparison, ComparisonOperator, Declaration, Equality,
     EqualityOperator, Expression, ExpressionHost, ExpressionVisitCombiner, ExpressionVisitor,
     Factor, FactorOperator, Identifier, LogicalAnd, OrOperator, Primary, Statement,
-    StatementHost as _, StatementVisitor, Sum, SumOperator, TypeError, Unary, Value,
+    StatementHost as _, StatementVisitor, Sum, SumOperator, TypeError, Unary, UnaryOperator, Value,
 };
-use crate::parser::{Error as ParseError, Parser};
-use crate::tokenizer::{Error as TokenError, Tokenizer};
+use crate::parser::Parser;
+use crate::tokenizer::Tokenizer;
+use crate::LoxError;
 use environment::Environment;
 
 #[derive(Default)]
@@ -144,9 +146,12 @@ impl Interpreter {
             .collect()
     }
 
-    pub fn run<'s>(&mut self, source: &'s str) -> Result<Vec<String>, Error<'s>> {
-        let tokens = Tokenizer::new(source).into_tokens()?;
-        let statements: Vec<Declaration> = Parser::new(&tokens).into_statements().try_collect()?;
+    pub fn run(&mut self, source: &str) -> Result<Vec<String>, LoxError> {
+        let tokens: Vec<_> = Tokenizer::new(source).try_collect()?;
+        let statements: Vec<Declaration> = Parser::new(&tokens)
+            .into_statements()
+            .try_collect()
+            .map_err(LoxError::Parsing)?;
 
         Ok(self.interpret(statements)?)
     }
@@ -158,15 +163,18 @@ impl Interpreter {
                     println!("{output}");
                 }
             }
-            Err(e) => eprintln!("{e:?}"),
+            Err(e) => eprintln!(
+                "{:?}",
+                miette::Report::from(e).with_source_code(line.to_owned())
+            ),
         }
     }
 
     pub fn run_with_prompt(
         &mut self,
         mut output: impl io::Write,
-        mut input: impl Iterator<Item = Result<String, impl error::Error + Send + Sync + 'static>>,
-    ) -> anyhow::Result<()> {
+        mut input: impl Iterator<Item = Result<String, impl Into<LoxError>>>,
+    ) -> Result<(), LoxError> {
         // TODO QoL:
         // * implicit print
         // * multiline input
@@ -179,7 +187,7 @@ impl Interpreter {
             let Some(line) = input.next() else {
                 break;
             };
-            let line = line.context("Failed to read line from input")? + ";";
+            let line = line.map_err(Into::into)? + ";";
 
             match self.run(&line) {
                 Ok(print) => {
@@ -189,7 +197,7 @@ impl Interpreter {
                     }
                     output.flush()?;
                 }
-                Err(e) => eprintln!("{e:?}"),
+                Err(e) => eprintln!("{:?}", miette::Error::from(e).with_source_code(line)),
             }
         }
         Ok(())
@@ -202,32 +210,7 @@ impl Interpreter {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum Error<'t> {
-    Tokenizing(TokenError),
-    Parsing(ParseError<'t>),
-    Runtime(RuntimeError),
-}
-
-impl<'t> From<RuntimeError> for Error<'t> {
-    fn from(v: RuntimeError) -> Self {
-        Self::Runtime(v)
-    }
-}
-
-impl<'t> From<ParseError<'t>> for Error<'t> {
-    fn from(v: ParseError<'t>) -> Self {
-        Self::Parsing(v)
-    }
-}
-
-impl<'t> From<TokenError> for Error<'t> {
-    fn from(v: TokenError) -> Self {
-        Self::Tokenizing(v)
-    }
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Error, Diagnostic)]
 pub enum RuntimeError {
     Type(TypeError),
     UndeclaredVariable(Identifier),
@@ -253,8 +236,6 @@ impl fmt::Display for RuntimeError {
         }
     }
 }
-
-impl error::Error for RuntimeError {}
 
 pub trait BinaryOperator<T: ExpressionHost<Interpreter>>: Copy {
     type Output: Into<Value>;
@@ -436,16 +417,28 @@ impl BinaryOperator<Factor> for SumOperator {
     type Error = TypeError;
 
     fn evaluate(self, lhs: Value, rhs: Value) -> Result<Self::Output, Self::Error> {
-        if let (Value::String(lhs), Self::Plus, Value::String(rhs)) = (&lhs, self, &rhs) {
-            let string = lhs.as_ref().to_owned() + rhs.as_ref();
-            return Ok(Value::String(string.into()));
+        if self == Self::Plus {
+            match (&lhs, &rhs) {
+                (Value::String(lhs), Value::String(rhs)) => {
+                    let string = lhs.as_ref().to_owned() + rhs.as_ref();
+                    return Ok(Value::String(string.into()));
+                }
+                (Value::String(_), _) => return Err(TypeError::SumString(rhs)),
+                (_, Value::String(_)) => return Err(TypeError::SumString(lhs)),
+                _ => (),
+            };
         }
-        let lhs = self.cast(&lhs)?;
-        let rhs = self.cast(&rhs)?;
-        Ok(match self {
-            Self::Minus => Value::Number(lhs - rhs),
-            Self::Plus => Value::Number(lhs + rhs),
-        })
+        let Some(lhs) = lhs.float() else {
+            return Err(TypeError::Sum(self, lhs));
+        };
+        let Some(rhs) = rhs.float() else {
+            return Err(TypeError::Sum(self, rhs));
+        };
+        let output = match self {
+            Self::Minus => lhs - rhs,
+            Self::Plus => lhs + rhs,
+        };
+        Ok(Value::Number(output))
     }
 }
 
@@ -474,5 +467,29 @@ impl BinaryOperator<Unary> for FactorOperator {
             Self::Divide => lhs / rhs,
             Self::Multiply => lhs * rhs,
         })
+    }
+}
+
+impl ComparisonOperator {
+    pub fn cast(self, value: Value) -> Result<f64, TypeError> {
+        value.float().ok_or(TypeError::Comparison(self, value))
+    }
+}
+
+impl FactorOperator {
+    pub fn cast(self, lhs: Value) -> Result<f64, TypeError> {
+        lhs.float().ok_or(TypeError::Factor(self, lhs))
+    }
+}
+
+impl UnaryOperator {
+    pub(crate) fn evaluate(self, value: Value) -> Result<Value, TypeError> {
+        match self {
+            Self::Minus => {
+                let value = value.float().ok_or(TypeError::UnaryMinus(value))?;
+                Ok(Value::Number(-value))
+            }
+            Self::Not => Ok(Value::Boolean(!value.is_truthy())),
+        }
     }
 }

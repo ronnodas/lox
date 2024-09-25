@@ -1,8 +1,9 @@
 use core::fmt;
-use std::error;
-use std::rc::Rc;
+use std::sync::Arc;
 
-pub type Identifier = Rc<str>;
+use thiserror::Error;
+
+pub type Identifier = Arc<str>;
 pub type LValue = Identifier;
 
 #[derive(Debug)]
@@ -96,34 +97,16 @@ pub enum ComparisonOperator {
     LessEqual,
 }
 
-impl ComparisonOperator {
-    pub fn cast(self, value: Value) -> Result<f64, TypeError> {
-        value.float().ok_or(TypeError::Comparison(self, value))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SumOperator {
     Minus,
     Plus,
 }
 
-impl SumOperator {
-    pub fn cast(self, lhs: &Value) -> Result<f64, TypeError> {
-        lhs.float().ok_or_else(|| TypeError::Sum(self, lhs.clone()))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactorOperator {
     Divide,
     Multiply,
-}
-
-impl FactorOperator {
-    pub fn cast(self, lhs: Value) -> Result<f64, TypeError> {
-        lhs.float().ok_or(TypeError::Factor(self, lhs))
-    }
 }
 
 impl From<Primary> for Unary {
@@ -136,18 +119,6 @@ impl From<Primary> for Unary {
 pub enum UnaryOperator {
     Minus,
     Not,
-}
-
-impl UnaryOperator {
-    pub(crate) fn evaluate(self, value: Value) -> Result<Value, TypeError> {
-        match self {
-            Self::Minus => {
-                let value = value.float().ok_or(TypeError::UnaryMinus(value))?;
-                Ok(Value::Number(-value))
-            }
-            Self::Not => Ok(Value::Boolean(!value.is_truthy())),
-        }
-    }
 }
 
 impl From<Statement> for Declaration {
@@ -238,7 +209,7 @@ impl From<Value> for Expression {
 }
 
 impl Value {
-    const fn float(&self) -> Option<f64> {
+    pub const fn float(&self) -> Option<f64> {
         match self {
             &Self::Number(number) => Some(number),
             &Self::Boolean(boolean) => Some(if boolean { 1.0 } else { 0.0 }),
@@ -255,35 +226,19 @@ impl Value {
     }
 }
 
-impl fmt::Display for TypeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Comparison(operator, value) => {
-                write!(
-                    f,
-                    "cannot cast {value} to float to compare using {operator}"
-                )
-            }
-            Self::Sum(operator, value) => {
-                write!(f, "cannot cast {value} to float to evaluate {operator}")
-            }
-            Self::Factor(operator, value) => {
-                write!(f, "cannot cast {value} to float to evaluate {operator}")
-            }
-            Self::UnaryMinus(value) => write!(f, "cannot cast {value} to float to negate"),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Error)]
 pub enum TypeError {
+    #[error("cannot compare {1} using {0}, not a number")]
     Comparison(ComparisonOperator, Value),
+    #[error("cannot add {0} to a string")]
+    SumString(Value),
+    #[error("cannot apply {0} to {1}, not a number")]
     Sum(SumOperator, Value),
+    #[error("cannot apply {0} to {1}, not a number")]
     Factor(FactorOperator, Value),
+    #[error("cannot negate {0}")]
     UnaryMinus(Value),
 }
-
-impl error::Error for TypeError {}
 
 impl Primary {
     pub(crate) fn group(expression: Expression) -> Self {

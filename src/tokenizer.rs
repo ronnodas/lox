@@ -1,198 +1,338 @@
 use std::iter::from_fn;
 use std::num::ParseFloatError;
-use std::{error, fmt};
+use std::ops::BitOr;
+use std::str::Chars;
 
-use itertools::Itertools as _;
+use miette::Diagnostic;
+use thiserror::Error;
 
-pub struct Tokenizer<'a> {
-    source: &'a str,
-    line: usize,
+pub struct Tokenizer<'t> {
+    reader: Reader<'t>,
+    state: State,
 }
 
-impl<'a> Tokenizer<'a> {
-    pub const fn new(source: &'a str) -> Self {
-        Self { source, line: 1 }
+#[derive(Debug, Clone, Copy)]
+enum State {
+    New,
+    Slash,
+    TestEqual(TestEqual),
+    String,
+    Number,
+    Identifier,
+    LineComment,
+    BlockComment(usize),
+    Errored,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TestEqual {
+    Bang,
+    Equal,
+    Less,
+    Greater,
+}
+
+impl TestEqual {
+    const fn equal<'t>(self) -> TokenKind<'t> {
+        match self {
+            Self::Bang => TokenKind::BangEqual,
+            Self::Equal => TokenKind::EqualEqual,
+            Self::Less => TokenKind::LessEqual,
+            Self::Greater => TokenKind::GreaterEqual,
+        }
     }
 
-    pub fn into_tokens(mut self) -> Result<Vec<SourceToken<'a>>, Error> {
-        let mut tokens: Vec<_> = from_fn(|| self.scan_token()).try_collect()?;
-        tokens.push(SourceToken::new(Token::Eof, self.line));
-        Ok(tokens)
+    const fn not_equal<'t>(self) -> TokenKind<'t> {
+        match self {
+            Self::Bang => TokenKind::Bang,
+            Self::Equal => TokenKind::Equal,
+            Self::Less => TokenKind::Less,
+            Self::Greater => TokenKind::Greater,
+        }
     }
+}
 
-    // TODO Add support for C-style /* ... */ block comments.
-    // Make sure to handle newlines in them. Consider allowing them to nest.
-    fn scan_token(&mut self) -> Option<Result<SourceToken<'a>, Error>> {
-        let token_type = loop {
-            let (c, rest) = split_first_char(self.source)?;
-            let backtrack = self.source;
-            self.source = rest;
-            break match c {
-                '(' => Token::LeftParen,
-                ')' => Token::RightParen,
-                '{' => Token::LeftBrace,
-                '}' => Token::RightBrace,
-                ',' => Token::Comma,
-                '.' => Token::Dot,
-                '-' => Token::Minus,
-                '+' => Token::Plus,
-                ';' => Token::Semicolon,
-                '*' => Token::Star,
+//TODO add a Seen(char) state to reduce (eliminate?) peeking
+impl<'t> Iterator for Tokenizer<'t> {
+    type Item = Result<Token<'t>, Error>;
 
-                '!' => self.if_next_equal(Token::BangEqual, Token::Bang),
-                '=' => self.if_next_equal(Token::EqualEqual, Token::Equal),
-                '<' => self.if_next_equal(Token::LessEqual, Token::Less),
-                '>' => self.if_next_equal(Token::GreaterEqual, Token::Greater),
+    fn next(&mut self) -> Option<Self::Item> {
+        let token = loop {
+            match self.state {
+                State::New => {
+                    self.reader.save();
+                    self.reader.trim_start();
 
-                '/' => {
-                    if self.try_read('/') {
-                        self.discard_comment();
-                        continue;
+                    let c = self.reader.next()?;
+                    if let Some(token) = TokenKind::single_char(c) {
+                        break token;
                     }
-                    Token::Slash
+
+                    self.state = match c {
+                        '!' => State::TestEqual(TestEqual::Bang),
+                        '=' => State::TestEqual(TestEqual::Equal),
+                        '<' => State::TestEqual(TestEqual::Less),
+                        '>' => State::TestEqual(TestEqual::Greater),
+                        '/' => State::Slash,
+                        '"' => State::String,
+                        '0'..='9' => State::Number,
+                        '_' => State::Identifier,
+                        c if c.is_alphabetic() => State::Identifier,
+
+                        c => return Some(Err(self.error(ErrorKind::UnexpectedCharacter(c)))),
+                    };
                 }
-
-                ' ' | '\r' | '\t' => continue,
-
-                '\n' => {
-                    self.line += 1;
-                    continue;
-                }
-
-                //TODO allow \" (and therefore \\) in strings
-                '"' => match self.split_once('"') {
-                    Some(string) => Token::String(string),
-                    None => return Some(Err(Error::UnterminatedString(self.line))),
+                State::Slash => match self.reader.peek() {
+                    Some('/') => {
+                        _ = self.reader.next();
+                        self.state = State::LineComment;
+                    }
+                    Some('*') => {
+                        _ = self.reader.next();
+                        self.state = State::BlockComment(0);
+                    }
+                    None | Some(_) => {
+                        break TokenKind::Slash;
+                    }
                 },
-
-                '0'..='9' => {
-                    self.source = backtrack;
-                    match self.number() {
-                        Ok(number) => Token::Number(number),
-                        Err(error) => return Some(Err(error)),
+                State::String => return Some(self.string()),
+                State::TestEqual(test) => {
+                    break if self.reader.peek() == Some('=') {
+                        _ = self.reader.next();
+                        test.equal()
+                    } else {
+                        test.not_equal()
+                    };
+                }
+                State::Number => return Some(self.number()),
+                State::Identifier => return Some(Ok(self.identifier())),
+                State::LineComment => {
+                    for c in self.reader.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
                     }
+                    self.state = State::New;
                 }
-
-                'a'..='z' | 'A'..='Z' | '_' => {
-                    self.source = backtrack;
-                    self.identifier()
+                State::BlockComment(depth) => {
+                    while let Some(c) = self.reader.next() {
+                        if c == '*' && self.reader.peek() == Some('/') {
+                            _ = self.reader.next();
+                            self.state =
+                                depth.checked_sub(1).map_or(State::New, State::BlockComment);
+                            break;
+                        } else if c == '/' && self.reader.peek() == Some('*') {
+                            _ = self.reader.next();
+                            self.state = State::BlockComment(depth + 1);
+                            break;
+                        }
+                    }
+                    return Some(Err(self.error(ErrorKind::UnterminatedBlockComment)));
                 }
-
-                c => return Some(Err(Error::UnexpectedCharacter(c, self.line))),
+                State::Errored => return None,
             };
         };
-        Some(Ok(SourceToken::new(token_type, self.line)))
-    }
 
-    fn discard_comment(&mut self) {
-        match self.split_once('\n') {
-            Some(_comment) => self.line += 1,
-            None => self.source = "", // comment terminated by eof
+        let (_, span) = self.reader.split_yielded();
+        self.state = State::New;
+        Some(Ok(Token::new(token, span)))
+    }
+}
+
+impl<'t> Tokenizer<'t> {
+    pub fn new(source: &'t str) -> Self {
+        Self {
+            reader: Reader::new(source),
+            state: State::New,
         }
     }
 
-    fn if_next_equal(&mut self, yes: Token<'a>, no: Token<'a>) -> Token<'a> {
-        if self.try_read('=') {
-            yes
-        } else {
-            no
-        }
-    }
-
-    fn try_read(&mut self, c: char) -> bool {
-        let Some((next, rest)) = split_first_char(self.source) else {
-            return false;
-        };
-        if next == c {
-            self.source = rest;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn split_once(&mut self, delimiter: char) -> Option<&'a str> {
-        match self.source.split_once(delimiter) {
-            Some((prefix, rest)) => {
-                self.source = rest;
-                self.line += prefix.matches('\n').count();
-                Some(prefix)
-            }
-            None => None,
-        }
-    }
-
-    fn number(&mut self) -> Result<f64, Error> {
-        let mut found_dot = false;
-        let mid = self.source.find(|c: char| {
-            if c.is_ascii_digit() {
-                false
-            } else if !found_dot && c == '.' {
-                found_dot = true;
-                false
+    fn string(&mut self) -> Result<Token<'t>, Error> {
+        let mut skip = false;
+        for c in self.reader.by_ref() {
+            if skip {
+                match c {
+                    '\\' | '"' => skip = false,
+                    _ => return Err(self.reader.error(ErrorKind::UnexpectedCharacter(c))),
+                }
             } else {
-                true
-            }
-        });
+                match c {
+                    '\\' => skip = true,
+                    '"' => {
+                        let (string, span) = self.reader.split_yielded();
+                        let string = string
+                            .strip_prefix('"')
+                            .and_then(|string| string.strip_suffix('"'))
+                            .unwrap_or_else(|| unreachable!("began and ended with `\"`"));
 
-        let (number, rest) = match mid {
-            Some(mid) => {
-                let (number, rest) = self.source.split_at(mid);
-                if number.ends_with('.') {
-                    self.source.split_at(mid - 1)
-                } else {
-                    (number, rest)
+                        self.state = State::New;
+                        return Ok(Token::new(TokenKind::String(string), span));
+                    }
+                    _ => (),
                 }
             }
-            None => (self.source, ""),
+        }
+        Err(self.reader.error(ErrorKind::UnterminatedString))
+    }
+
+    fn number(&mut self) -> Result<Token<'t>, Error> {
+        let mut found_dot = false;
+        let (string, span) = match from_fn(|| self.reader.with_index()).find_map(|(at, c)| {
+            if c.is_ascii_digit() {
+                None
+            } else if c == '.' && !found_dot {
+                found_dot = true;
+                None
+            } else {
+                Some(at)
+            }
+        }) {
+            Some(at) => {
+                let (string, span) = self.reader.split_at(at);
+                if string.ends_with('.') {
+                    self.reader.split_at(at - '.'.len_utf8())
+                } else {
+                    (string, span)
+                }
+            }
+            None => self.reader.split_yielded(),
         };
-        self.source = rest;
-        number.parse().map_err(|e| Error::FloatParse(e, self.line))
-    }
-
-    fn identifier(&mut self) -> Token<'a> {
-        let (identifier, rest) = self
-            .source
-            .find(|c: char| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'))
-            .map_or((self.source, ""), |mid| self.source.split_at(mid));
-        self.source = rest;
-
-        Token::keyword(identifier).unwrap_or(Token::Identifier(identifier))
-    }
-}
-
-fn split_first_char(s: &str) -> Option<(char, &str)> {
-    let mut chars = s.chars();
-    chars.next().map(|c| (c, chars.as_str()))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-    UnexpectedCharacter(char, usize),
-    UnterminatedString(usize),
-    FloatParse(ParseFloatError, usize),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnexpectedCharacter(c, line) => {
-                write!(f, "Unexpected character: {c:?} on line {line}")
-            }
-            Self::UnterminatedString(line) => {
-                write!(f, "Unterminated string starting on line {line}")
-            }
-            Self::FloatParse(error, line) => {
-                write!(f, "Failed to parse float on line {line}: {error}")
+        match string.parse() {
+            Err(e) => Err(self.reader.error(ErrorKind::FloatParse(e))),
+            Ok(number) => {
+                self.state = State::New;
+                Ok(Token::new(TokenKind::Number(number), span))
             }
         }
     }
+
+    fn identifier(&mut self) -> Token<'t> {
+        let (identifier, span) = match from_fn(|| self.reader.with_index())
+            .find(|(_, c)| !c.is_alphanumeric() && c != &'_')
+        {
+            Some((at, _)) => self.reader.split_at(at),
+            None => self.reader.split_yielded(),
+        };
+        let kind = TokenKind::keyword(identifier).unwrap_or(TokenKind::Identifier(identifier));
+
+        self.state = State::New;
+        Token::new(kind, span)
+    }
+
+    fn error(&mut self, error: ErrorKind) -> Error {
+        self.state = State::Errored;
+        self.reader.error(error)
+    }
 }
 
-impl error::Error for Error {}
+#[derive(Debug)]
+struct Reader<'t> {
+    source: &'t str,
+    rest: &'t str,
+    chars: Chars<'t>,
+    yielded_bytes: usize,
+}
+
+impl<'t> Reader<'t> {
+    fn new(source: &'t str) -> Self {
+        Self {
+            source,
+            rest: source,
+            chars: source.chars(),
+            yielded_bytes: 0,
+        }
+    }
+
+    fn save(&mut self) {
+        self.rest = self.chars.as_str();
+        self.yielded_bytes = 0;
+    }
+
+    fn error(&self, error: ErrorKind) -> Error {
+        Error {
+            source_code: self.source.to_owned(),
+            bad_bit: self.span(),
+            kind: error,
+        }
+    }
+
+    fn split_yielded(&self) -> (&'t str, SourceSpan) {
+        let (split, _) = self.rest.split_at(self.yielded_bytes);
+        (split, self.span())
+    }
+
+    fn split_at(&mut self, at: usize) -> (&'t str, SourceSpan) {
+        let (split, rest) = self.rest.split_at(at);
+        self.chars = rest.chars();
+        self.yielded_bytes = at;
+        (split, self.span())
+    }
+
+    fn span(&self) -> SourceSpan {
+        (self.source.len() - self.rest.len(), self.yielded_bytes).into()
+    }
+
+    fn trim_start(&mut self) {
+        self.rest = self.rest.trim_start();
+        self.chars = self.rest.chars();
+        self.yielded_bytes = 0;
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.clone().next()
+    }
+
+    fn with_index(&mut self) -> Option<(usize, char)> {
+        Some((self.yielded_bytes, self.next()?))
+    }
+}
+
+impl Iterator for Reader<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let c = self.chars.next()?;
+        self.yielded_bytes += c.len_utf8();
+        Some(c)
+    }
+}
+
+#[derive(Error, Debug, Diagnostic, Clone, PartialEq, Eq)]
+#[error("{kind}")]
+pub struct Error {
+    #[source_code]
+    source_code: String,
+    #[label]
+    bad_bit: SourceSpan,
+    kind: ErrorKind,
+}
+
+#[derive(Error, Debug, Diagnostic, Clone, PartialEq, Eq)]
+enum ErrorKind {
+    #[error("Unexpected character '{0}'")]
+    UnexpectedCharacter(char),
+    #[error("Unterminated string")]
+    UnterminatedString,
+    #[error("Failed to parse float '{0}'")]
+    FloatParse(#[from] ParseFloatError),
+    #[error("Unterminated block comment")]
+    UnterminatedBlockComment,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Token<'a> {
+pub struct Token<'t> {
+    pub kind: TokenKind<'t>,
+    pub span: SourceSpan,
+}
+
+impl<'t> Token<'t> {
+    const fn new(kind: TokenKind<'t>, span: SourceSpan) -> Self {
+        Self { kind, span }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TokenKind<'t> {
     // Single-character tokens.
     LeftParen,
     RightParen,
@@ -217,8 +357,8 @@ pub enum Token<'a> {
     LessEqual,
 
     // Literals.
-    Identifier(&'a str),
-    String(&'a str),
+    Identifier(&'t str),
+    String(&'t str),
     Number(f64),
 
     // Keywords.
@@ -238,21 +378,36 @@ pub enum Token<'a> {
     True,
     Var,
     While,
-
-    Eof,
 }
 
-impl<'a> Token<'a> {
-    pub fn keyword(identifier: &str) -> Option<Self> {
+impl<'t> TokenKind<'t> {
+    const fn single_char(c: char) -> Option<Self> {
+        let token = match c {
+            '(' => Self::LeftParen,
+            ')' => Self::RightParen,
+            '{' => Self::LeftBrace,
+            '}' => Self::RightBrace,
+            ',' => Self::Comma,
+            '.' => Self::Dot,
+            '-' => Self::Minus,
+            '+' => Self::Plus,
+            ';' => Self::Semicolon,
+            '*' => Self::Star,
+            _ => return None,
+        };
+        Some(token)
+    }
+
+    fn keyword(identifier: &str) -> Option<Self> {
         let keyword = match identifier {
-            "and" => Token::And,
-            "class" => Token::Class,
-            "else" => Token::Else,
-            "false" => Token::False,
-            "for" => Token::For,
-            "fun" => Token::Fun,
-            "if" => Token::If,
-            "nil" => Token::Nil,
+            "and" => Self::And,
+            "class" => Self::Class,
+            "else" => Self::Else,
+            "false" => Self::False,
+            "for" => Self::For,
+            "fun" => Self::Fun,
+            "if" => Self::If,
+            "nil" => Self::Nil,
             "or" => Self::Or,
             "print" => Self::Print,
             "return" => Self::Return,
@@ -268,47 +423,65 @@ impl<'a> Token<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SourceToken<'a> {
-    pub token: Token<'a>,
-    pub line: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSpan {
+    start: usize,
+    len: usize,
 }
 
-impl<'a> SourceToken<'a> {
-    pub const fn new(token: Token<'a>, line: usize) -> Self {
-        Self { token, line }
+impl SourceSpan {
+    const fn end(&self) -> usize {
+        self.start + self.len
+    }
+}
+
+impl From<(usize, usize)> for SourceSpan {
+    fn from((start, len): (usize, usize)) -> Self {
+        Self { start, len }
+    }
+}
+
+impl From<SourceSpan> for miette::SourceSpan {
+    fn from(value: SourceSpan) -> Self {
+        (value.start, value.len).into()
+    }
+}
+
+#[expect(
+    clippy::suspicious_arithmetic_impl,
+    reason = "easier to find end than len"
+)]
+impl BitOr for SourceSpan {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        let start = self.start.min(rhs.start);
+        Self {
+            start,
+            len: self.end().max(rhs.end()) - start,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceToken, Token, Tokenizer};
+
+    use super::{TokenKind, Tokenizer};
 
     #[test]
-    fn tokenizer() {
+    fn tokenizer() -> miette::Result<()> {
         let source = "2 < 3";
 
-        let tokenizer = Tokenizer::new(source);
-        assert_eq!(
-            &tokenizer.into_tokens().unwrap(),
-            &[
-                SourceToken {
-                    token: Token::Number(2.0),
-                    line: 1
-                },
-                SourceToken {
-                    token: Token::Less,
-                    line: 1
-                },
-                SourceToken {
-                    token: Token::Number(3.0),
-                    line: 1
-                },
-                SourceToken {
-                    token: Token::Eof,
-                    line: 1
-                }
-            ]
-        );
+        let mut tokenizer = Tokenizer::new(source);
+        for expected in [
+            TokenKind::Number(2.0),
+            TokenKind::Less,
+            TokenKind::Number(3.0),
+        ] {
+            let kind = tokenizer.next().unwrap()?.kind;
+            assert_eq!(kind, expected);
+        }
+        assert!(tokenizer.next().is_none());
+        Ok(())
     }
 }
