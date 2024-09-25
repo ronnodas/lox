@@ -70,7 +70,7 @@ pub enum Primary {
     Identifier(Identifier),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Number(f64),
     String(Identifier),
@@ -78,9 +78,9 @@ pub enum Value {
     Nil,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct OrOperator;
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct AndOperator;
 
 #[derive(Clone, Copy, Debug)]
@@ -89,7 +89,7 @@ pub enum EqualityOperator {
     NotEqual,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComparisonOperator {
     Greater,
     GreaterEqual,
@@ -97,13 +97,13 @@ pub enum ComparisonOperator {
     LessEqual,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SumOperator {
     Minus,
     Plus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FactorOperator {
     Divide,
     Multiply,
@@ -226,7 +226,7 @@ impl Value {
     }
 }
 
-#[derive(Debug, PartialEq, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum TypeError {
     #[error("cannot compare {1} using {0}, not a number")]
     Comparison(ComparisonOperator, Value),

@@ -11,7 +11,7 @@ pub struct Tokenizer<'t> {
     state: State,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum State {
     New,
     Slash,
@@ -24,7 +24,7 @@ enum State {
     Errored,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TestEqual {
     Bang,
     Equal,
@@ -297,7 +297,7 @@ impl Iterator for Reader<'_> {
     }
 }
 
-#[derive(Error, Debug, Diagnostic, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
 #[error("{kind}")]
 pub struct Error {
     #[source_code]
@@ -307,7 +307,7 @@ pub struct Error {
     kind: ErrorKind,
 }
 
-#[derive(Error, Debug, Diagnostic, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
 enum ErrorKind {
     #[error("Unexpected character '{0}'")]
     UnexpectedCharacter(char),
@@ -319,7 +319,7 @@ enum ErrorKind {
     UnterminatedBlockComment,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Token<'t> {
     pub kind: TokenKind<'t>,
     pub span: SourceSpan,
@@ -331,7 +331,7 @@ impl<'t> Token<'t> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TokenKind<'t> {
     // Single-character tokens.
     LeftParen,
@@ -423,7 +423,7 @@ impl<'t> TokenKind<'t> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceSpan {
     start: usize,
     len: usize,

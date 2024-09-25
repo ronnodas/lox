@@ -31,7 +31,7 @@ fn main() -> miette::Result<()> {
     Ok(())
 }
 
-#[derive(Error, Debug, Diagnostic)]
+#[derive(Debug, Diagnostic, Error)]
 pub(crate) enum LoxError {
     #[error("IO error")]
     Io(

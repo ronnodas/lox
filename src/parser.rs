@@ -500,7 +500,7 @@ impl<'t> MatchToken<'t> for UnaryOperator {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Error, Diagnostic, Clone, Copy)]
+#[derive(Clone, Copy, Debug, Diagnostic, Eq, Error, PartialEq)]
 pub enum ParseError {
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -510,7 +510,7 @@ pub enum ParseError {
     UnexpectedEndOfInput,
 }
 
-#[derive(Debug, PartialEq, Eq, Error, Diagnostic, Clone, Copy)]
+#[derive(Clone, Copy, Debug, Diagnostic, Eq, Error, PartialEq)]
 #[error("{}", self.kind)]
 #[diagnostic()]
 pub struct WithSpan {
@@ -533,7 +533,7 @@ impl WithSpan {
 }
 
 //TODO add expected token to UnexpectedToken, probably want to pull in strum
-#[derive(Error, Debug, Diagnostic, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Diagnostic, Eq, Error, PartialEq)]
 enum ErrorKind {
     #[error("Unexpected token while parsing")]
     UnexpectedToken,

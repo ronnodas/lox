@@ -210,7 +210,7 @@ impl Interpreter {
     }
 }
 
-#[derive(Debug, PartialEq, Error, Diagnostic)]
+#[derive(Debug, Diagnostic, Error, PartialEq)]
 pub enum RuntimeError {
     Type(TypeError),
     UndeclaredVariable(Identifier),
