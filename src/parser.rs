@@ -405,9 +405,7 @@ impl<'t> Parse<'t> for Value {
             TokenKind::False => Self::Boolean(false),
             TokenKind::True => Self::Boolean(true),
             TokenKind::Nil => Self::Nil,
-            TokenKind::String(string) => {
-                Self::String(string.replace(r#"\""#, "\"").replace("\\\\", "\\").into())
-            }
+            TokenKind::String(string) => Self::string(string),
             _ => return Ok(None),
         };
         parser.tokens = rest;

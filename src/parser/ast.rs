@@ -224,6 +224,26 @@ impl Value {
             Self::Number(_) | Self::String(_) => true,
         }
     }
+
+    pub fn string(escaped: &str) -> Self {
+        let mut seen_slash = false;
+        let string: String = escaped
+            .chars()
+            .filter_map(|c| match c {
+                c if seen_slash => {
+                    seen_slash = false;
+                    Some(c)
+                }
+                '\\' => {
+                    seen_slash = true;
+                    None
+                }
+                c => Some(c),
+            })
+            .collect();
+
+        Self::String(string.into())
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]

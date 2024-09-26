@@ -175,6 +175,7 @@ impl Interpreter {
         mut output: impl io::Write,
         mut input: impl Iterator<Item = Result<String, impl Into<LoxError>>>,
     ) -> Result<(), LoxError> {
+        // TODO use something like https://crates.io/crates/rustyline
         // TODO QoL:
         // * implicit print
         // * multiline input
