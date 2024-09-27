@@ -1,10 +1,12 @@
 use std::iter::from_fn;
 use std::num::ParseFloatError;
-use std::ops::BitOr;
 use std::str::Chars;
 
 use miette::Diagnostic;
+use strum::EnumDiscriminants;
 use thiserror::Error;
+
+use super::span::Span;
 
 pub struct Tokenizer<'t> {
     reader: Reader<'t>,
@@ -227,7 +229,7 @@ impl<'t> Tokenizer<'t> {
 
 #[derive(Debug)]
 struct Reader<'t> {
-    source: &'t str,
+    source_len: usize,
     rest: &'t str,
     chars: Chars<'t>,
     yielded_bytes: usize,
@@ -236,7 +238,7 @@ struct Reader<'t> {
 impl<'t> Reader<'t> {
     fn new(source: &'t str) -> Self {
         Self {
-            source,
+            source_len: source.len(),
             rest: source,
             chars: source.chars(),
             yielded_bytes: 0,
@@ -250,26 +252,25 @@ impl<'t> Reader<'t> {
 
     fn error(&self, error: ErrorKind) -> Error {
         Error {
-            source_code: self.source.to_owned(),
-            bad_bit: self.span(),
+            span: self.span(),
             kind: error,
         }
     }
 
-    fn split_yielded(&self) -> (&'t str, SourceSpan) {
+    fn split_yielded(&self) -> (&'t str, Span) {
         let (split, _) = self.rest.split_at(self.yielded_bytes);
         (split, self.span())
     }
 
-    fn split_at(&mut self, at: usize) -> (&'t str, SourceSpan) {
+    fn split_at(&mut self, at: usize) -> (&'t str, Span) {
         let (split, rest) = self.rest.split_at(at);
         self.chars = rest.chars();
         self.yielded_bytes = at;
         (split, self.span())
     }
 
-    fn span(&self) -> SourceSpan {
-        (self.source.len() - self.rest.len(), self.yielded_bytes).into()
+    fn span(&self) -> Span {
+        (self.source_len - self.rest.len(), self.yielded_bytes).into()
     }
 
     fn trim_start(&mut self) {
@@ -300,15 +301,13 @@ impl Iterator for Reader<'_> {
 #[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
 #[error("{kind}")]
 pub struct Error {
-    #[source_code]
-    source_code: String,
     #[label]
-    bad_bit: SourceSpan,
-    kind: ErrorKind,
+    pub span: Span,
+    pub kind: ErrorKind,
 }
 
 #[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
-enum ErrorKind {
+pub enum ErrorKind {
     #[error("Unexpected character '{0}'")]
     UnexpectedCharacter(char),
     #[error("Unterminated string")]
@@ -322,16 +321,17 @@ enum ErrorKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Token<'t> {
     pub kind: TokenKind<'t>,
-    pub span: SourceSpan,
+    pub span: Span,
 }
 
 impl<'t> Token<'t> {
-    const fn new(kind: TokenKind<'t>, span: SourceSpan) -> Self {
+    const fn new(kind: TokenKind<'t>, span: Span) -> Self {
         Self { kind, span }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, EnumDiscriminants)]
+#[strum_discriminants(name(TokenTag))]
 pub enum TokenKind<'t> {
     // Single-character tokens.
     LeftParen,
@@ -423,42 +423,47 @@ impl<'t> TokenKind<'t> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceSpan {
-    start: usize,
-    len: usize,
-}
-
-impl SourceSpan {
-    const fn end(&self) -> usize {
-        self.start + self.len
-    }
-}
-
-impl From<(usize, usize)> for SourceSpan {
-    fn from((start, len): (usize, usize)) -> Self {
-        Self { start, len }
-    }
-}
-
-impl From<SourceSpan> for miette::SourceSpan {
-    fn from(value: SourceSpan) -> Self {
-        (value.start, value.len).into()
-    }
-}
-
-#[expect(
-    clippy::suspicious_arithmetic_impl,
-    reason = "easier to find end than len"
-)]
-impl BitOr for SourceSpan {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self::Output {
-        let start = self.start.min(rhs.start);
-        Self {
-            start,
-            len: self.end().max(rhs.end()) - start,
+impl TokenTag {
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::LeftParen => "a '('",
+            Self::RightParen => "a ')'",
+            Self::LeftBrace => "a '{'",
+            Self::RightBrace => "a '}'",
+            Self::Comma => "a ','",
+            Self::Dot => "a '.'",
+            Self::Minus => "a '-'",
+            Self::Plus => "a '+'",
+            Self::Semicolon => "a ';'",
+            Self::Slash => "a '/'",
+            Self::Star => "a '*'",
+            Self::Bang => "a '!'",
+            Self::BangEqual => "a '!='",
+            Self::Equal => "an '='",
+            Self::EqualEqual => "an '=='",
+            Self::Greater => "a '>'",
+            Self::GreaterEqual => "a '>='",
+            Self::Less => "a '<'",
+            Self::LessEqual => "a '<='",
+            Self::Identifier => "an identifier",
+            Self::String => "a string",
+            Self::Number => "a number",
+            Self::And => "an 'and'",
+            Self::Class => "the keyword 'class'",
+            Self::Else => "the keyword 'else'",
+            Self::False => "a 'false'",
+            Self::For => "the keyword 'for'",
+            Self::Fun => "the keyword 'fun'",
+            Self::If => "the keyword 'if'",
+            Self::Nil => "a 'nil'",
+            Self::Or => "an 'or'",
+            Self::Print => "the keyword 'print'",
+            Self::Return => "the keyword 'return'",
+            Self::Super => "the keyword 'super'",
+            Self::This => "the keyword 'this'",
+            Self::True => "a 'true'",
+            Self::Var => "the keyword 'var'",
+            Self::While => "the keyword 'while'",
         }
     }
 }

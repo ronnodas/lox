@@ -1,555 +1,506 @@
 pub mod ast;
 pub mod printer;
+mod span;
+mod tokenizer;
 
-use std::iter::from_fn;
+use std::iter::Peekable;
 
-use ast::{
-    AndOperator, Assignment, ComparisonOperator, Declaration, EqualityOperator, Expression,
-    FactorOperator, Fold, Identifier, IntoLValue as _, LogicalOr, OrOperator, Primary, Statement,
-    SumOperator, Unary, UnaryOperator, Value,
-};
-use itertools::Itertools as _;
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::tokenizer::{SourceSpan, Token, TokenKind};
+use ast::{Ast, Atom, Binary, Bp, Grouping, Node, Prefix, Value};
+pub use span::Span;
+use tokenizer::{
+    Error as TokenError, ErrorKind as TokenErrorKind, Token, TokenKind, TokenTag, Tokenizer,
+};
 
-type WithSpanResult<T> = Result<Option<(T, SourceSpan)>, ParseError>;
+type AstResult = Result<Option<Node>, ParseError>;
 
-pub struct Parser<'p, 't> {
-    tokens: &'p [Token<'t>],
+const EXPRESSION_START: &str = "a new expression";
+const STATEMENT_START: &str = "a new statement";
+const STATEMENT_END: &str = "a ; or a }";
+const IDENTIFIER: &str = "an identifier";
+
+pub const INFIX_DOT_BINDING_POWER: (u8, u8) = (21, 22);
+pub const INFIX_CALL_BINDING_POWER: (u8, u8) = (19, 20);
+pub const PREFIX_MINUS_NOT_BINDING_POWER: u8 = 17;
+pub const INFIX_PRODUCT_BINDING_POWER: (u8, u8) = (15, 16);
+pub const INFIX_SUM_BINDING_POWER: (u8, u8) = (13, 14);
+pub const INFIX_COMPARISON_BINDING_POWER: (u8, u8) = (11, 12);
+pub const INFIX_EQUALITY_BINDING_POWER: (u8, u8) = (9, 10);
+pub const INFIX_AND_BINDING_POWER: (u8, u8) = (7, 8);
+pub const INFIX_OR_BINDING_POWER: (u8, u8) = (5, 6);
+pub const INFIX_ASSIGNMENT_BINDING_POWER: (u8, u8) = (4, 3);
+pub const PREFIX_PRINT_BINDING_POWER: u8 = 1;
+
+pub struct Parser<'t> {
+    source: &'t str,
+    tokens: Peekable<Tokenizer<'t>>,
 }
 
-impl<'t, 'p> Parser<'p, 't> {
-    pub const fn new(tokens: &'p [Token<'t>]) -> Self {
-        Self { tokens }
-    }
-
-    pub fn into_statements(mut self) -> impl Iterator<Item = Result<Declaration, ParseError>> + 'p {
-        from_fn(move || {
-            let statement = self.parse().transpose()?;
-            if statement.is_err() {
-                self.recover();
-            }
-            Some(statement)
-        })
-    }
-
-    fn parse<T: Parse<'t>>(&mut self) -> Result<Option<T>, ParseError> {
-        T::parse(self)
-    }
-
-    fn with_span<T: Parse<'t>>(&mut self) -> WithSpanResult<T> {
-        T::with_span(self)
-    }
-
-    fn print_statement(&mut self) -> WithSpanResult<Statement> {
-        let Ok(print) = self.consume(&TokenKind::Print) else {
-            return Ok(None);
-        };
-        let Some(expression) = self.parse()? else {
-            return Err(self.unexpected());
-        };
-
-        let Ok(semicolon) = self.consume(&TokenKind::Semicolon) else {
-            return Err(WithSpan::from_token(ErrorKind::UnterminatedPrint, &print).into());
-        };
-
-        let print_statement = Statement::Print(expression);
-        Ok(Some((print_statement, print.span | semicolon.span)))
-    }
-
-    fn expression_statement(&mut self) -> WithSpanResult<Statement> {
-        let Some((expression, span)) = self.with_span()? else {
-            return Ok(None);
-        };
-        let span = span | self.consume(&TokenKind::Semicolon)?.span;
-        Ok(Some((Statement::Expression(expression), span)))
-    }
-
-    fn block(&mut self) -> WithSpanResult<Statement> {
-        if let Ok(left) = self.consume(&TokenKind::LeftBrace) {
-            let declarations = from_fn(|| self.parse().transpose()).try_collect()?;
-            let span = left.span | self.consume(&TokenKind::RightBrace)?.span;
-            Ok(Some((Statement::Block(declarations), span)))
-        } else {
-            Ok(None)
+impl<'t> Parser<'t> {
+    pub fn new(source: &'t str) -> Self {
+        Self {
+            source,
+            tokens: Tokenizer::new(source).peekable(),
         }
     }
 
-    fn unexpected(&self) -> ParseError {
+    #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
+    fn parse(&mut self, binding_power: Bp, break_on: &[TokenTag]) -> AstResult {
+        if self.matches_next(break_on) {
+            return Ok(None);
+        }
+        let Token {
+            kind: start,
+            mut span,
+        } = match self.tokens.next() {
+            Some(token) => token?,
+            None => return Ok(None),
+        };
+        let Some(start) = Start::new(start) else {
+            return Err(WithSpan::new(ErrorKind::UnexpectedToken(EXPRESSION_START), span).into());
+        };
+        match start {
+            Start::Atom(atom) => {
+                let mut node = Ast::Atom(atom);
+                loop {
+                    let Some(Ok(op)) = self.tokens.peek() else {
+                        break;
+                    };
+                    let Some((op, left_bp, right_bp)) = Infix::new(op.kind) else {
+                        break;
+                    };
+                    if left_bp <= binding_power {
+                        break;
+                    }
+                    _ = self.tokens.next();
+                    let Some(right) = self.parse(right_bp, break_on)? else {
+                        return Err(ParseError::UnexpectedEndOfInput(EXPRESSION_START));
+                    };
+                    let right_span = right.span;
+                    node = match op {
+                        Infix::Op(op) => {
+                            Ast::Binary(op, Box::new([Node { ast: node, span }, right]))
+                        }
+                        Infix::Assignment => {
+                            let lvalue = node
+                                .lvalue()
+                                .ok_or_else(|| ErrorKind::InvalidLValue.with_span(span))?;
+                            Ast::Assignment(lvalue, Box::new(right))
+                        }
+                    };
+                    span |= right_span;
+                }
+                //TODO handle postfix
+                Ok(Some(Node { ast: node, span }))
+            }
+            Start::Prefix(op) => match self.parse(op.right_binding_power(), break_on)? {
+                Some(right) => {
+                    let right_span = right.span;
+                    Ok(Some(Node {
+                        ast: Ast::Prefix(op, Box::new(right)),
+                        span: span | right_span,
+                    }))
+                }
+                _ => Err(WithSpan::new(ErrorKind::UnexpectedToken(EXPRESSION_START), span).into()),
+            },
+            Start::Group(Grouping::Brace) => {
+                let mut items = Vec::new();
+                loop {
+                    dbg!(&items);
+                    if let Some(node) =
+                        self.parse(0, &[TokenTag::Semicolon, TokenTag::RightBrace])?
+                    {
+                        span |= node.span;
+                        items.push(node);
+                    }
+                    match self.tokens.peek().map(Result::as_ref).transpose()? {
+                        Some(Token {
+                            kind: TokenKind::Semicolon,
+                            ..
+                        }) => {
+                            _ = self.tokens.next();
+                        }
+                        Some(Token {
+                            kind: TokenKind::RightBrace,
+                            span: brace_span,
+                        }) => {
+                            span |= *brace_span;
+                            _ = self.tokens.next();
+                            break;
+                        }
+                        Some(_) => (),
+                        None => return Err(ParseError::UnexpectedEndOfInput(STATEMENT_END)),
+                    }
+                }
+                Ok(Some(Node {
+                    ast: Ast::Group(Grouping::Brace, items),
+                    span,
+                }))
+            }
+            Start::Unary(marker) => {
+                let (end, consume) = marker.terminator();
+                let one = self.parse(0, end)?;
+                if consume {
+                    for &terminator in end {
+                        span |= self.expect(terminator)?.span;
+                    }
+                }
+                marker.form(one, span).map(Some)
+            }
+            Start::For => {
+                _ = self.expect(TokenTag::LeftParen)?;
+                let initialization = self.parse(0, &[TokenTag::Semicolon])?;
+                _ = self.expect(TokenTag::Semicolon)?;
+                let condition = Box::new(self.parse(0, &[TokenTag::Semicolon])?.unwrap_or(Node {
+                    ast: Ast::Atom(Atom::Value(Value::Boolean(true))),
+                    span: (0, 0).into(),
+                }));
+                _ = self.expect(TokenTag::Semicolon)?;
+                let increment = self.parse(0, &[TokenTag::RightParen])?.map(Box::new);
+                _ = self.expect(TokenTag::RightParen)?;
+                let body = Box::new(self.parse(binding_power, break_on)?.ok_or_else(|| {
+                    ErrorKind::SyntaxError("for loop must have a body").with_span(span)
+                })?);
+                span |= body.span;
+                let for_node = Node {
+                    ast: Ast::For {
+                        condition,
+                        increment,
+                        body,
+                    },
+                    span,
+                };
+                let block = match initialization {
+                    Some(initialization) => {
+                        vec![initialization, for_node]
+                    }
+                    None => vec![for_node],
+                };
+                Ok(Some(Node {
+                    ast: Ast::Group(Grouping::Brace, block),
+                    span,
+                }))
+            }
+            Start::While => {
+                _ = self.expect(TokenTag::LeftParen)?;
+                let condition =
+                    Box::new(self.parse(0, &[TokenTag::Semicolon])?.ok_or_else(|| {
+                        ErrorKind::SyntaxError("while loop must have non-empty condition")
+                            .with_span(span)
+                    })?);
+                _ = self.expect(TokenTag::RightParen)?;
+                let body = Box::new(self.parse(binding_power, break_on)?.ok_or_else(|| {
+                    ErrorKind::SyntaxError("while loop must have a body").with_span(span)
+                })?);
+                span |= body.span;
+                Ok(Some(Node {
+                    ast: Ast::For {
+                        condition,
+                        increment: None,
+                        body,
+                    },
+                    span,
+                }))
+            }
+        }
+    }
+
+    fn matches_next(&mut self, tags: &[TokenTag]) -> bool {
         self.tokens
-            .first()
-            .map_or(ParseError::UnexpectedEndOfInput, |token| {
-                WithSpan::from_token(ErrorKind::UnexpectedToken, token).into()
+            .peek()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|token| tags.contains(&TokenTag::from(token.kind)))
+    }
+
+    fn expect(&mut self, terminator: TokenTag) -> Result<Token, ParseError> {
+        match self.tokens.peek().map(Result::as_ref).transpose()? {
+            Some(token) if TokenTag::from(token.kind) == terminator => {
+                Ok(self.tokens.next().unwrap_or_else(|| unreachable!())?)
+            }
+            Some(token) => Err(ErrorKind::UnexpectedToken(terminator.description())
+                .with_span(token.span)
+                .into()),
+            None => Err(ParseError::UnexpectedEndOfInput(terminator.description())),
+        }
+    }
+}
+
+impl<'t> Iterator for Parser<'t> {
+    type Item = Result<Node, ParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // TODO return spans for better errors
+        let node = self.parse(0, &[]).transpose()?;
+        _ = self.expect(TokenTag::Semicolon);
+        Some(node)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Start {
+    Atom(Atom),
+    Prefix(Prefix),
+    Group(Grouping),
+    Unary(FancyUnary),
+    For,
+    While,
+}
+
+impl Start {
+    pub fn new(kind: TokenKind) -> Option<Self> {
+        Atom::from_token(kind)
+            .map(Self::Atom)
+            .or_else(|| Prefix::from_token(kind).map(Self::Prefix))
+            .or_else(|| match kind {
+                TokenKind::LeftBrace => Some(Self::Group(Grouping::Brace)),
+                TokenKind::Var => Some(Self::Unary(FancyUnary::Var)),
+                TokenKind::LeftParen => Some(Self::Unary(FancyUnary::LeftParen)),
+                TokenKind::For => Some(Self::For),
+                TokenKind::While => Some(Self::While),
+                TokenKind::RightParen
+                | TokenKind::RightBrace
+                | TokenKind::Comma
+                | TokenKind::Dot
+                | TokenKind::Minus
+                | TokenKind::Plus
+                | TokenKind::Semicolon
+                | TokenKind::Slash
+                | TokenKind::Star
+                | TokenKind::Bang
+                | TokenKind::BangEqual
+                | TokenKind::Equal
+                | TokenKind::EqualEqual
+                | TokenKind::Greater
+                | TokenKind::GreaterEqual
+                | TokenKind::Less
+                | TokenKind::LessEqual
+                | TokenKind::Identifier(_)
+                | TokenKind::String(_)
+                | TokenKind::Number(_)
+                | TokenKind::And
+                | TokenKind::Class
+                | TokenKind::Else
+                | TokenKind::False
+                | TokenKind::Fun
+                | TokenKind::If
+                | TokenKind::Nil
+                | TokenKind::Or
+                | TokenKind::Print
+                | TokenKind::Return
+                | TokenKind::Super
+                | TokenKind::This
+                | TokenKind::True => None,
             })
     }
+}
 
-    fn consume(&mut self, kind: &TokenKind) -> Result<Token<'t>, ParseError> {
-        if let Some((&next, rest)) = self.tokens.split_first() {
-            if &next.kind == kind {
-                self.tokens = rest;
-                Ok(next)
-            } else {
-                Err(WithSpan::from_token(ErrorKind::UnexpectedToken, &next).into())
-            }
-        } else {
-            Err(ParseError::UnexpectedEndOfInput)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FancyUnary {
+    Var,
+    LeftParen,
+}
+
+impl FancyUnary {
+    const fn terminator(&self) -> (&[TokenTag], bool) {
+        match self {
+            Self::Var => (&[TokenTag::Semicolon], false),
+            Self::LeftParen => (&[TokenTag::RightParen], true),
         }
     }
 
-    fn consume_identifier(&mut self) -> Option<(Identifier, SourceSpan)> {
-        if let (
-            &Token {
-                kind: TokenKind::Identifier(identifier),
-                span,
+    fn form(self, one: Option<Node>, span: Span) -> Result<Node, ParseError> {
+        match self {
+            Self::Var => {
+                let one = one.ok_or_else(|| {
+                    ErrorKind::SyntaxError("var should be followed by an identifier")
+                        .with_span(span)
+                })?;
+
+                let ast = match one.ast.unparen() {
+                    Ast::Assignment(left, right) => Ast::Declaration(left, Some(right)),
+                    Ast::Atom(Atom::Identifier(identifier)) => Ast::Declaration(identifier, None),
+                    Ast::Parenthesized(..) => unreachable!("called unparen()"),
+                    _ => {
+                        return Err(ErrorKind::SyntaxError(
+                            "`var` must be followed by a variable or assignment",
+                        )
+                        .with_span(span)
+                        .into())
+                    }
+                };
+                let ast = ast;
+                Ok(Node { ast, span })
+            }
+            Self::LeftParen => {
+                let one = one.ok_or_else(|| {
+                    ErrorKind::SyntaxError("empty parentheses are only allowed in a function call")
+                        .with_span(span)
+                })?;
+                Ok(Node {
+                    ast: Ast::Parenthesized(Box::new(one)),
+                    span,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Infix {
+    Op(Binary),
+    Assignment,
+}
+
+impl Infix {
+    pub fn new(token: TokenKind) -> Option<(Self, Bp, Bp)> {
+        Binary::from_token(token).map_or_else(
+            || {
+                let (left, right) = INFIX_ASSIGNMENT_BINDING_POWER;
+                (token == TokenKind::Equal).then_some((Self::Assignment, left, right))
             },
-            rest,
-        ) = self.tokens.split_first()?
-        {
-            self.tokens = rest;
-            Some((identifier.into(), span))
-        } else {
-            None
-        }
-    }
-
-    fn consume_match<T: MatchToken<'t>>(&mut self) -> Option<T> {
-        self.consume_match_with_span().map(|(t, _)| t)
-    }
-
-    fn consume_match_with_span<T: MatchToken<'t>>(&mut self) -> Option<(T, SourceSpan)> {
-        let (next, rest) = self.tokens.split_first()?;
-        let span = next.span;
-        if let Some(next) = T::match_token(next.kind) {
-            self.tokens = rest;
-            Some((next, span))
-        } else {
-            None
-        }
-    }
-
-    fn recover(&mut self) {
-        let mid = if let Some(mid) = self
-            .tokens
-            .iter()
-            .position(|t| t.kind == TokenKind::Semicolon)
-        {
-            mid
-        } else {
-            self.tokens.len()
-        };
-        self.tokens = &self.tokens[mid..];
-    }
-
-    fn variable_declaration(&mut self) -> WithSpanResult<Declaration> {
-        let span = match self.consume(&TokenKind::Var) {
-            Ok(token) => token.span,
-            Err(_) => return Ok(None),
-        };
-        let Some(Primary::Identifier(identifier)) = self.parse()? else {
-            return Err(self.unexpected());
-        };
-        let initializer = if self.consume(&TokenKind::Equal).is_ok() {
-            self.parse()?
-        } else {
-            None
-        };
-        let span = span | self.consume(&TokenKind::Semicolon)?.span;
-        let declaration = Declaration::VariableDeclaration {
-            identifier,
-            initializer,
-        };
-        Ok(Some((declaration, span)))
-    }
-
-    fn if_statement(&mut self) -> WithSpanResult<Statement> {
-        let start = match self.consume(&TokenKind::If) {
-            Ok(token) => token.span,
-            Err(_) => return Ok(None),
-        };
-        _ = self.consume(&TokenKind::LeftParen)?;
-        let Some(condition) = self.parse()? else {
-            return Err(self.unexpected());
-        };
-        _ = self.consume(&TokenKind::RightParen)?;
-        let Some((then_branch, mut end)) = self.with_span()? else {
-            return Err(self.unexpected());
-        };
-        let else_branch = if self.consume(&TokenKind::Else).is_ok() {
-            if let Some((else_branch, else_end)) = self.with_span()? {
-                end = else_end;
-                Some(Box::new(else_branch))
-            } else {
-                return Err(self.unexpected());
-            }
-        } else {
-            None
-        };
-
-        let statement = Statement::If {
-            condition,
-            then_branch: Box::new(then_branch),
-            else_branch,
-        };
-        Ok(Some((statement, start | end)))
-    }
-
-    fn while_statement(&mut self) -> WithSpanResult<Statement> {
-        let start = match self.consume(&TokenKind::While) {
-            Ok(token) => token.span,
-            Err(_) => return Ok(None),
-        };
-        _ = self.consume(&TokenKind::LeftParen)?;
-        let Some(condition) = self.parse()? else {
-            return Err(self.unexpected());
-        };
-        _ = self.consume(&TokenKind::RightParen)?;
-        let Some((body, end)) = self.with_span()? else {
-            return Err(self.unexpected());
-        };
-        let statement = Statement::While {
-            condition,
-            body: Box::new(body),
-        };
-        Ok(Some((statement, start | end)))
-    }
-
-    fn for_statement(&mut self) -> WithSpanResult<Statement> {
-        let start = match self.consume(&TokenKind::For) {
-            Ok(token) => token.span,
-            Err(_) => return Ok(None),
-        };
-        _ = self.consume(&TokenKind::LeftParen)?;
-        let initializer = self.parse()?;
-        if initializer.is_none() {
-            _ = self.consume(&TokenKind::Semicolon)?;
-        }
-        let condition = self.parse()?;
-        _ = self.consume(&TokenKind::Semicolon)?;
-        let increment = self.parse()?;
-        _ = self.consume(&TokenKind::RightParen)?;
-        let Some((body, end)) = self.with_span()? else {
-            return Err(self.unexpected());
-        };
-        let for_statement = desugar_for(initializer, condition, increment, body);
-        Ok(Some((for_statement, start | end)))
+            |op| {
+                let (left, right) = op.binding_power();
+                Some((Self::Op(op), left, right))
+            },
+        )
     }
 }
 
-fn desugar_for(
-    initializer: Option<ForInitializer>,
-    condition: Option<Expression>,
-    increment: Option<Expression>,
-    body: Statement,
-) -> Statement {
-    let body = Box::new(match increment {
-        Some(increment) => {
-            Statement::Block(vec![body.into(), Statement::Expression(increment).into()])
-        }
-        None => body,
-    });
-    let condition = condition.unwrap_or_else(|| Value::Boolean(true).into());
-    let body = Statement::While { condition, body };
-    match initializer {
-        Some(initializer) => Statement::Block(vec![initializer.into(), body.into()]),
-        None => body,
-    }
-}
-
-enum ForInitializer {
-    Declaration(Declaration),
-    Expression(Expression),
-}
-
-impl From<ForInitializer> for Declaration {
-    fn from(initializer: ForInitializer) -> Self {
-        match initializer {
-            ForInitializer::Declaration(declaration) => declaration,
-            ForInitializer::Expression(expression) => Statement::Expression(expression).into(),
-        }
-    }
-}
-
-pub trait Parse<'t>: Sized {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self>;
-
-    fn parse(parser: &mut Parser<'_, 't>) -> Result<Option<Self>, ParseError> {
-        Self::with_span(parser).map(|value| value.map(|(value, _)| value))
-    }
-}
-
-//TODO maybe inline and restructure once all the different statements are implemented
-impl<'t> Parse<'t> for Declaration {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        if let declaration @ Some(_) = parser.variable_declaration()? {
-            Ok(declaration)
-        } else {
-            Ok(parser
-                .with_span()?
-                .map(|(statement, span)| (Self::Statement(statement), span)))
-        }
-    }
-}
-
-impl<'t> Parse<'t> for Statement {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        if let statement @ Some(_) = parser.print_statement()? {
-            Ok(statement)
-        } else if let statement @ Some(_) = parser.block()? {
-            Ok(statement)
-        } else if let statement @ Some(_) = parser.if_statement()? {
-            Ok(statement)
-        } else if let statement @ Some(_) = parser.while_statement()? {
-            Ok(statement)
-        } else if let statement @ Some(_) = parser.for_statement()? {
-            Ok(statement)
-        } else {
-            parser.expression_statement()
-        }
-    }
-}
-
-impl<'t> Parse<'t> for Expression {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        let Some((expression, span)) = parser.with_span::<LogicalOr>()? else {
-            return Ok(None);
-        };
-        if parser.consume(&TokenKind::Equal).is_err() {
-            return Ok(Some((Self::Or(expression), span)));
-        };
-        let Some(lvalue) = expression.lvalue() else {
-            return Err(WithSpan::new(ErrorKind::InvalidLValue, span).into());
-        };
-        let Some((expression, end)) = parser.with_span()? else {
-            return Err(parser.unexpected());
-        };
-        let assignment = Self::Assignment(Assignment {
-            lvalue,
-            expression: Box::new(expression),
-        });
-        Ok(Some((assignment, span | end)))
-    }
-}
-
-impl<'t, T: Parse<'t>, Op: MatchToken<'t>> Parse<'t> for Fold<T, Op> {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        let this = &mut *parser;
-        let Some((start, mut span)) = this.with_span()? else {
-            return Ok(None);
-        };
-        let mut more = Vec::new();
-        while let Some(operator) = this.consume_match() {
-            let Some((right, right_span)) = this.with_span()? else {
-                return Err(this.unexpected());
-            };
-            more.push((operator, right));
-            span = span | right_span;
-        }
-        Ok(Some((Self { start, more }, span)))
-    }
-}
-
-impl<'t> Parse<'t> for Unary {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        if let Some((operator, span)) = parser.consume_match_with_span() {
-            let Some((right, right_span)) = parser.with_span()? else {
-                return Err(parser.unexpected());
-            };
-            let unary = Self::Unary(operator, Box::new(right));
-            Ok(Some((unary, span | right_span)))
-        } else {
-            parser
-                .with_span()
-                .map(|e| e.map(|(e, span)| (Self::Primary(e), span)))
-        }
-    }
-}
-
-impl<'t> Parse<'t> for Primary {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        if let Some((value, span)) = parser.with_span()? {
-            return Ok(Some((Self::Literal(value), span)));
-        }
-        if let Some((identifier, span)) = parser.consume_identifier() {
-            return Ok(Some((Self::Identifier(identifier), span)));
-        }
-        let Ok(left) = parser.consume(&TokenKind::LeftParen) else {
-            return Ok(None);
-        };
-        let Some(expression) = parser.parse()? else {
-            let error = match parser.tokens.first() {
-                Some(&token) => WithSpan::from_token(ErrorKind::UnexpectedToken, &token),
-                None => WithSpan::from_token(ErrorKind::UnmatchedParen, &left),
-            };
-            return Err(error.into());
-        };
-        match parser.consume(&TokenKind::RightParen) {
-            Ok(right) => Ok(Some((Self::group(expression), left.span | right.span))),
-            Err(ParseError::UnexpectedEndOfInput) => {
-                Err(WithSpan::from_token(ErrorKind::UnmatchedParen, &left).into())
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> Parse<'t> for Value {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        let Some((token, rest)) = parser.tokens.split_first() else {
-            return Ok(None);
-        };
-        let value = match token.kind {
-            TokenKind::Number(number) => Self::Number(number),
-            TokenKind::False => Self::Boolean(false),
-            TokenKind::True => Self::Boolean(true),
-            TokenKind::Nil => Self::Nil,
-            TokenKind::String(string) => Self::string(string),
-            _ => return Ok(None),
-        };
-        parser.tokens = rest;
-        Ok(Some((value, token.span)))
-    }
-}
-
-impl<'t> Parse<'t> for ForInitializer {
-    fn with_span(parser: &mut Parser<'_, 't>) -> WithSpanResult<Self> {
-        if let Some((initializer, span)) = parser.variable_declaration()? {
-            Ok(Some((Self::Declaration(initializer), span)))
-        } else if let Some((expression, span)) = parser.with_span()? {
-            Ok(Some((Self::Expression(expression), span)))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-pub trait MatchToken<'t>: Sized {
-    fn match_token(token: TokenKind) -> Option<Self>;
-}
-
-impl<'t> MatchToken<'t> for OrOperator {
-    fn match_token(token: TokenKind) -> Option<Self> {
-        (token == TokenKind::Or).then_some(Self)
-    }
-}
-
-impl<'t> MatchToken<'t> for AndOperator {
-    fn match_token(token: TokenKind) -> Option<Self> {
-        (token == TokenKind::And).then_some(Self)
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for EqualityOperator {
-    fn match_token(token: TokenKind) -> Option<Self> {
-        match token {
-            TokenKind::BangEqual => Some(Self::NotEqual),
-            TokenKind::EqualEqual => Some(Self::Equal),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for ComparisonOperator {
-    fn match_token(token: TokenKind) -> Option<Self> {
-        match token {
-            TokenKind::Greater => Some(Self::Greater),
-            TokenKind::GreaterEqual => Some(Self::GreaterEqual),
-            TokenKind::Less => Some(Self::Less),
-            TokenKind::LessEqual => Some(Self::LessEqual),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for SumOperator {
-    fn match_token(token: TokenKind) -> Option<Self> {
-        match token {
-            TokenKind::Minus => Some(Self::Minus),
-            TokenKind::Plus => Some(Self::Plus),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for FactorOperator {
-    fn match_token(token: TokenKind) -> Option<Self> {
-        match token {
-            TokenKind::Slash => Some(Self::Divide),
-            TokenKind::Star => Some(Self::Multiply),
-            _ => None,
-        }
-    }
-}
-
-#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-impl<'t> MatchToken<'t> for UnaryOperator {
-    fn match_token(token: TokenKind) -> Option<Self> {
-        match token {
-            TokenKind::Minus => Some(Self::Minus),
-            TokenKind::Bang => Some(Self::Not),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Diagnostic, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
 pub enum ParseError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     WithSpan(#[from] WithSpan),
     // TODO support batching
-    #[error("Input ended before parsing finished")]
-    UnexpectedEndOfInput,
+    #[error("Reached end of input but expecting {0}")]
+    UnexpectedEndOfInput(&'static str),
 }
 
-#[derive(Clone, Copy, Debug, Diagnostic, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
 #[error("{}", self.kind)]
 #[diagnostic()]
 pub struct WithSpan {
     kind: ErrorKind,
     #[label("{}", self.kind.label())]
-    span: SourceSpan,
+    span: Span,
 }
 
 impl WithSpan {
-    const fn new(kind: ErrorKind, span: SourceSpan) -> Self {
+    pub const fn new(kind: ErrorKind, span: Span) -> Self {
         Self { kind, span }
-    }
-
-    const fn from_token(kind: ErrorKind, token: &Token<'_>) -> Self {
-        Self {
-            kind,
-            span: token.span,
-        }
     }
 }
 
 //TODO add expected token to UnexpectedToken, probably want to pull in strum
-#[derive(Clone, Copy, Debug, Diagnostic, Eq, Error, PartialEq)]
-enum ErrorKind {
-    #[error("Unexpected token while parsing")]
-    UnexpectedToken,
+#[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
+pub enum ErrorKind {
+    #[error(transparent)]
+    TokenizingError(#[from] TokenErrorKind),
+    #[error("Unexpected token while parsing, expecting {0}")]
+    UnexpectedToken(&'static str),
     #[error("Unmatched parenthesis")]
     UnmatchedParen,
     #[error("Unterminated print statement")]
     UnterminatedPrint,
+    #[error("Syntax error: {0}")]
+    SyntaxError(&'static str),
     #[error("Invalid l-value")]
     InvalidLValue,
 }
 
 impl ErrorKind {
-    const fn label(self) -> &'static str {
+    const fn label(&self) -> &'static str {
         match self {
-            Self::UnexpectedToken => "this token",
+            Self::UnexpectedToken(_) => "this token",
             Self::UnmatchedParen => "this open parenthesis",
             Self::UnterminatedPrint => "print starts here",
             Self::InvalidLValue => "this expression cannot be assigned to",
+            Self::SyntaxError(_) => "in this expression",
+            Self::TokenizingError(_) => "",
+        }
+    }
+
+    const fn with_span(self, span: Span) -> WithSpan {
+        WithSpan::new(self, span)
+    }
+}
+
+impl From<TokenError> for ParseError {
+    fn from(error: TokenError) -> Self {
+        WithSpan::new(error.kind.into(), error.span).into()
+    }
+}
+
+impl From<&TokenError> for ParseError {
+    fn from(error: &TokenError) -> Self {
+        WithSpan::new(error.kind.clone().into(), error.span).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use itertools::Itertools as _;
+
+    use super::*;
+
+    fn test_parse(source: &str) -> miette::Result<()> {
+        let ast: Vec<Node> = Parser::new(source)
+            .try_collect()
+            .map_err(|e| miette::Report::from(e).with_source_code(source.to_owned()))?;
+        assert_eq!(ast.len(), 1);
+        let ast = ast.into_iter().next().unwrap();
+        assert_eq!(source, ast.to_string(), "{ast:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn literals() {
+        for source in [
+            "1",
+            "1.23",
+            "\"\"",
+            "\"\\\"\"",
+            "\"hello\"",
+            "true",
+            "false",
+            "nil",
+        ] {
+            if let Err(e) = test_parse(source) {
+                eprintln!("failed to parse '{source}': {e:?}");
+                panic!();
+            }
+        }
+    }
+
+    #[test]
+    fn plus_minus() {
+        for source in [
+            "1 + 2",
+            "\"abc\" + \"def\"",
+            "1 + 2 + 3 + 4",
+            "1 - 2 + 3 - 4",
+        ] {
+            if let Err(e) = test_parse(source) {
+                eprintln!("failed to parse '{source}': {e:?}");
+                panic!();
+            }
+        }
+    }
+
+    #[test]
+    fn times_divide() {
+        for source in [
+            "1 * 2",
+            "\"abc\" * \"def\"",
+            "1 * 2 * 3 / 4",
+            "1 / 2 + 3 / 4",
+        ] {
+            if let Err(e) = test_parse(source) {
+                eprintln!("failed to parse '{source}': {e:?}");
+                panic!();
+            }
         }
     }
 }
