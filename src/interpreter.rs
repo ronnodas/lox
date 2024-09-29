@@ -8,7 +8,8 @@ use miette::Diagnostic;
 use thiserror::Error;
 
 use crate::parser::ast::{
-    Atom, Binary, Grouping, Identifier, LValue, Node, Prefix, TypeError, Value, Visitor,
+    Atom, Binary, ExpressionNode, ExpressionVisitor, Identifier, LValue, Prefix, StatementNode,
+    StatementVisitor, TypeError, Value,
 };
 use crate::parser::{Parser, Span};
 use crate::LoxError;
@@ -20,92 +21,116 @@ pub struct Interpreter {
     environment: Environment,
 }
 
-impl Visitor for Interpreter {
-    type Output = (Value, Vec<String>);
+impl StatementVisitor for Interpreter {
+    type Output = Vec<String>;
+    type Error = RuntimeError;
+
+    fn visit_expression(
+        &mut self,
+        expression: &ExpressionNode,
+    ) -> Result<Self::Output, Self::Error> {
+        _ = expression.host(self)?;
+        Ok(vec![])
+    }
+
+    fn visit_print(&mut self, expression: &ExpressionNode) -> Result<Self::Output, Self::Error> {
+        let value = expression.host(self)?;
+        Ok(vec![value.to_string()])
+    }
+
+    fn visit_block(&mut self, items: &[StatementNode]) -> Result<Self::Output, Self::Error> {
+        self.environment.push();
+        let output = items.iter().try_fold(
+            vec![],
+            |mut output, item| -> Result<Self::Output, Self::Error> {
+                let new_output = item.host(self)?;
+                output.extend(new_output);
+                Ok(output)
+            },
+        )?;
+        self.environment.pop();
+
+        Ok(output)
+    }
+
+    fn visit_declaration(
+        &mut self,
+        identifier: &Identifier,
+        initializer: Option<&ExpressionNode>,
+    ) -> Result<Self::Output, Self::Error> {
+        let value = initializer.map(|node| node.host(self)).transpose()?;
+        self.environment.declare(identifier, value);
+        Ok(vec![])
+    }
+
+    fn visit_while(
+        &mut self,
+        condition: &ExpressionNode,
+        body: &StatementNode,
+    ) -> Result<Self::Output, Self::Error> {
+        let mut prints = vec![];
+        loop {
+            let condition = condition.host(self)?;
+            if !condition.is_truthy() {
+                break;
+            }
+            let print = body.host(self)?;
+            prints.extend(print);
+        }
+        Ok(prints)
+    }
+}
+
+impl ExpressionVisitor for Interpreter {
+    type Output = Value;
     type Error = RuntimeError;
 
     fn visit_atom(&mut self, atom: &Atom, _span: Span) -> Result<Self::Output, Self::Error> {
         match atom {
-            Atom::Value(value) => Ok((value.clone(), vec![])),
-            Atom::Identifier(identifier) => self
-                .environment
-                .get(identifier)
-                .ok_or(RuntimeError::UndeclaredVariable(Identifier::clone(
-                    identifier,
-                )))
-                .map(|value| (value, vec![])),
+            Atom::Value(value) => Ok(value.clone()),
+            Atom::Identifier(identifier) => {
+                self.environment
+                    .get(identifier)
+                    .ok_or(RuntimeError::UndeclaredVariable(Identifier::clone(
+                        identifier,
+                    )))
+            }
         }
     }
 
     fn visit_prefix(
         &mut self,
         op: Prefix,
-        arg: &Node,
-        _span: Span,
+        arg: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error> {
-        let (value, output) = arg.host(self)?;
+        let value = arg.host(self)?;
         match op {
             Prefix::Minus => value
                 .float()
-                .map(|number| (Value::Number(-number), output))
+                .map(|number| Value::Number(-number))
                 .ok_or_else(|| TypeError::UnaryMinus(value).into()),
-            Prefix::Not => Ok((Value::Boolean(!value.is_truthy()), output)),
-            Prefix::Print => {
-                let mut output = output;
-                output.push(format!("{value}"));
-                Ok((Value::Nil, output))
-            }
+            Prefix::Not => Ok(Value::Boolean(!value.is_truthy())),
         }
     }
 
     fn visit_binary(
         &mut self,
         op: Binary,
-        [left, right]: &[Node; 2],
-        _span: Span,
+        [left, right]: &[ExpressionNode; 2],
     ) -> Result<Self::Output, Self::Error> {
         match op {
             Binary::Logical(op) => {
-                let (left, output_left) = left.host(self)?;
+                let left = left.host(self)?;
                 if op.short_circuit(&left) {
-                    Ok((left, output_left))
+                    Ok(left)
                 } else {
-                    let (right, output_right) = right.host(self)?;
-                    let output = [output_left, output_right].concat();
-                    Ok((right, output))
+                    right.host(self)
                 }
             }
             Binary::Arithmetic(_) | Binary::Comparison(_) | Binary::Equality(_) => {
-                let (left, output_left) = left.host(self)?;
-                let (right, output_right) = right.host(self)?;
-                let output = [output_left, output_right].concat();
-                let value = op.evaluate(left, right)?;
-
-                Ok((value, output))
-            }
-        }
-    }
-
-    fn visit_group(
-        &mut self,
-        grouping: Grouping,
-        items: &[Node],
-        _span: Span,
-    ) -> Result<Self::Output, Self::Error> {
-        match grouping {
-            Grouping::Brace => {
-                self.environment.push();
-                let (value, output) = items.iter().try_fold(
-                    (Value::Nil, vec![]),
-                    |(_, mut output), item| -> Result<Self::Output, Self::Error> {
-                        let (value, new_output) = item.host(self)?;
-                        output.extend(new_output);
-                        Ok((value, output))
-                    },
-                )?;
-                self.environment.pop();
-
-                Ok((value, output))
+                let left = left.host(self)?;
+                let right = right.host(self)?;
+                op.evaluate(left, right).map_err(RuntimeError::from)
             }
         }
     }
@@ -113,73 +138,35 @@ impl Visitor for Interpreter {
     fn visit_assignment(
         &mut self,
         left: &LValue,
-        right: &Node,
-        _span: Span,
+        right: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error> {
-        let (value, output) = right.host(self)?;
+        let value = right.host(self)?;
         self.environment
             .set(left, value.clone())
             .ok_or(RuntimeError::UndeclaredVariable(Identifier::clone(left)))?;
-        Ok((value, output))
-    }
-
-    fn visit_declaration(
-        &mut self,
-        identifier: &Identifier,
-        initializer: Option<&Node>,
-        _span: Span,
-    ) -> Result<Self::Output, Self::Error> {
-        let (value, output) = initializer.map(|node| node.host(self)).transpose()?.unzip();
-        self.environment.declare(identifier, value.clone());
-        Ok((value.unwrap_or(Value::Nil), output.unwrap_or_default()))
-    }
-
-    fn visit_for(
-        &mut self,
-        condition: &Node,
-        body: &Node,
-        increment: Option<&Node>,
-        _span: Span,
-    ) -> Result<Self::Output, Self::Error> {
-        let (mut value, mut prints) = (Value::Nil, vec![]);
-        loop {
-            let (condition, print) = condition.host(self)?;
-            prints.extend(print);
-            if !condition.is_truthy() {
-                break;
-            }
-            let (body, print) = body.host(self)?;
-            value = body;
-            prints.extend(print);
-            if let Some(increment) = increment {
-                let (_, print) = increment.host(self)?;
-                prints.extend(print);
-            }
-        }
-        Ok((value, prints))
+        Ok(value)
     }
 }
 
 impl Interpreter {
     pub fn interpret<'i>(
         &'i mut self,
-        statements: impl IntoIterator<Item = Node> + 'i,
+        statements: impl IntoIterator<Item = StatementNode> + 'i,
     ) -> Result<Vec<String>, RuntimeError> {
         statements
             .into_iter()
-            .map(|declaration| declaration.host(self))
-            .map_ok(|(_, output)| output)
+            .map(|statement| statement.host(self))
             .flatten_ok()
             .collect()
     }
 
     pub fn run(&mut self, source: &str, print_last: bool) -> Result<Vec<String>, LoxError> {
-        let mut statements: Vec<Node> = Parser::new(source)
+        let mut statements: Vec<StatementNode> = Parser::new(source)
             .try_collect()
             .map_err(LoxError::Parsing)?;
         if print_last {
             if let Some(node) = statements.pop() {
-                let node = node.wrap_in_print();
+                let node = node.implicit_print();
                 statements.push(node);
             }
         }

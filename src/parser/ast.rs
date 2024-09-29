@@ -7,7 +7,7 @@ use super::tokenizer::TokenKind;
 use super::{
     INFIX_AND_BINDING_POWER, INFIX_COMPARISON_BINDING_POWER, INFIX_EQUALITY_BINDING_POWER,
     INFIX_OR_BINDING_POWER, INFIX_PRODUCT_BINDING_POWER, INFIX_SUM_BINDING_POWER,
-    PREFIX_MINUS_NOT_BINDING_POWER, PREFIX_PRINT_BINDING_POWER,
+    PREFIX_MINUS_NOT_BINDING_POWER,
 };
 
 pub type Identifier = Arc<str>;
@@ -15,73 +15,72 @@ pub type Str = Arc<str>;
 pub type LValue = Identifier;
 pub type Bp = u8;
 
-/*
-Binding Order:
-
-Paren (group)
-Brace (group)
-
-Class
-For
-Fun
-If
-Var
-While
-
-*/
-
-#[derive(Debug)]
-pub struct Node {
-    pub ast: Ast,
+pub struct StatementNode {
+    pub statement: Statement,
     pub span: Span,
 }
 
-impl Node {
-    pub fn host<V: Visitor>(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+impl StatementNode {
+    pub fn host<V: StatementVisitor>(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
         visitor.visit(self)
     }
 
-    pub fn wrap_in_print(self) -> Self {
-        if let Ast::Prefix(Prefix::Print, _) = self.ast {
-            self
-        } else {
-            let span = self.span;
-            Self {
-                ast: Ast::Prefix(Prefix::Print, Box::new(self)),
-                span,
-            }
+    pub fn implicit_print(self) -> Self {
+        let statement = match self.statement {
+            Statement::Expression(expression_node) => Statement::Print(expression_node),
+            statement @ (Statement::Print(_)
+            | Statement::Declaration(..)
+            | Statement::While { .. }
+            | Statement::Block(_)) => statement,
+        };
+        Self {
+            statement,
+            span: self.span,
         }
+    }
+}
+
+pub enum Statement {
+    Expression(ExpressionNode),
+    Print(ExpressionNode),
+    Declaration(Identifier, Option<ExpressionNode>),
+    While {
+        condition: ExpressionNode,
+        body: Box<StatementNode>,
+    },
+    Block(Vec<StatementNode>),
+}
+
+#[derive(Debug)]
+pub struct ExpressionNode {
+    pub expression: Expression,
+    pub span: Span,
+}
+
+impl ExpressionNode {
+    pub fn host<V: ExpressionVisitor>(&self, visitor: &mut V) -> Result<V::Output, V::Error> {
+        visitor.visit(self)
     }
 }
 
 #[derive(Debug)]
-pub enum Ast {
+pub enum Expression {
     Atom(Atom),
-    Prefix(Prefix, Box<Node>),
-    Binary(Binary, Box<[Node; 2]>),
-    Declaration(Identifier, Option<Box<Node>>),
-    Assignment(LValue, Box<Node>),
-    For {
-        condition: Box<Node>,
-        body: Box<Node>,
-        increment: Option<Box<Node>>,
-    },
-    Parenthesized(Box<Node>),
-    Group(Grouping, Vec<Node>),
+    Prefix(Prefix, Box<ExpressionNode>),
+    Binary(Binary, Box<[ExpressionNode; 2]>),
+    Parenthesized(Box<ExpressionNode>),
+    Assignment(LValue, Box<ExpressionNode>),
 }
 
-impl Ast {
+impl Expression {
     pub fn lvalue(&self) -> Option<LValue> {
         match &self {
             Self::Atom(Atom::Identifier(identifier)) => Some(Identifier::clone(identifier)),
-            _ => None,
-        }
-    }
-
-    pub fn unparen(self) -> Self {
-        match self {
-            Self::Parenthesized(node) => node.ast.unparen(),
-            _ => self,
+            Self::Atom(_)
+            | Self::Prefix(..)
+            | Self::Binary(..)
+            | Self::Parenthesized(_)
+            | Self::Assignment(..) => None,
         }
     }
 }
@@ -197,14 +196,12 @@ impl Value {
 pub enum Prefix {
     Minus,
     Not,
-    Print,
 }
 
 impl Prefix {
     pub const fn right_binding_power(self) -> u8 {
         match self {
             Self::Minus | Self::Not => PREFIX_MINUS_NOT_BINDING_POWER,
-            Self::Print => PREFIX_PRINT_BINDING_POWER,
         }
     }
 
@@ -212,7 +209,7 @@ impl Prefix {
         let op = match token {
             TokenKind::Minus => Self::Minus,
             TokenKind::Bang => Self::Not,
-            TokenKind::Print => Self::Print,
+
             TokenKind::LeftParen
             | TokenKind::RightParen
             | TokenKind::LeftBrace
@@ -242,6 +239,7 @@ impl Prefix {
             | TokenKind::If
             | TokenKind::Nil
             | TokenKind::Or
+            | TokenKind::Print
             | TokenKind::Return
             | TokenKind::Super
             | TokenKind::This
@@ -443,14 +441,7 @@ impl Equality {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Grouping {
-    Brace,
-}
-
-impl Grouping {}
-
-pub trait Visitor {
+pub trait ExpressionVisitor {
     type Output;
     type Error;
 
@@ -458,71 +449,65 @@ pub trait Visitor {
     fn visit_prefix(
         &mut self,
         op: Prefix,
-        arg: &Node,
-        span: Span,
+        arg: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error>;
     fn visit_binary(
         &mut self,
         op: Binary,
-        args: &[Node; 2],
-        span: Span,
-    ) -> Result<Self::Output, Self::Error>;
-    fn visit_group(
-        &mut self,
-        grouping: Grouping,
-        items: &[Node],
-        span: Span,
+        args: &[ExpressionNode; 2],
     ) -> Result<Self::Output, Self::Error>;
     fn visit_assignment(
         &mut self,
         left: &LValue,
-        right: &Node,
-        span: Span,
-    ) -> Result<Self::Output, Self::Error>;
-    fn visit_declaration(
-        &mut self,
-        identifier: &Identifier,
-        initializer: Option<&Node>,
-        span: Span,
-    ) -> Result<Self::Output, Self::Error>;
-    fn visit_for(
-        &mut self,
-        condition: &Node,
-        body: &Node,
-        increment: Option<&Node>,
-        span: Span,
+        right: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error>;
 
-    fn visit(&mut self, node: &Node) -> Result<Self::Output, Self::Error> {
-        match &node.ast {
-            Ast::Atom(atom) => self.visit_atom(atom, node.span),
-            Ast::Prefix(op, arg) => self.visit_prefix(*op, arg, node.span),
-            Ast::Binary(op, args) => self.visit_binary(*op, args, node.span),
-            Ast::Group(op, args) => self.visit_group(*op, args, node.span),
-            Ast::Declaration(identifier, initializer) => {
-                self.visit_declaration(identifier, initializer.as_ref().map(Box::as_ref), node.span)
-            }
-            Ast::Assignment(left, right) => self.visit_assignment(left, right, node.span),
-            Ast::Parenthesized(inner) => self.visit_parenthesized(inner, node.span),
-            Ast::For {
-                condition,
-                body,
-                increment,
-            } => self.visit_for(
-                condition,
-                body,
-                increment.as_ref().map(Box::as_ref),
-                node.span,
-            ),
+    fn visit(&mut self, node: &ExpressionNode) -> Result<Self::Output, Self::Error> {
+        match &node.expression {
+            Expression::Atom(atom) => self.visit_atom(atom, node.span),
+            Expression::Prefix(op, arg) => self.visit_prefix(*op, arg),
+            Expression::Binary(op, args) => self.visit_binary(*op, args),
+            Expression::Assignment(left, right) => self.visit_assignment(left, right),
+            Expression::Parenthesized(inner) => self.visit_parenthesized(inner),
         }
     }
 
-    fn visit_parenthesized(
-        &mut self,
-        node: &Node,
-        _span: Span,
-    ) -> Result<Self::Output, Self::Error> {
+    fn visit_parenthesized(&mut self, node: &ExpressionNode) -> Result<Self::Output, Self::Error> {
         self.visit(node)
+    }
+}
+
+pub trait StatementVisitor {
+    type Output;
+    type Error;
+
+    fn visit_expression(
+        &mut self,
+        expression: &ExpressionNode,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_print(&mut self, expression: &ExpressionNode) -> Result<Self::Output, Self::Error>;
+    fn visit_block(&mut self, items: &[StatementNode]) -> Result<Self::Output, Self::Error>;
+    fn visit_declaration(
+        &mut self,
+        identifier: &Identifier,
+        initializer: Option<&ExpressionNode>,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_while(
+        &mut self,
+        condition: &ExpressionNode,
+        body: &StatementNode,
+    ) -> Result<Self::Output, Self::Error>;
+
+    fn visit(&mut self, node: &StatementNode) -> Result<Self::Output, Self::Error> {
+        match &node.statement {
+            Statement::Expression(expression) => self.visit_expression(expression),
+            Statement::Print(expression) => self.visit_print(expression),
+            Statement::Declaration(identifier, initializer) => {
+                self.visit_declaration(identifier, initializer.as_ref())
+            }
+            Statement::While { condition, body } => self.visit_while(condition, body),
+            Statement::Block(statements) => self.visit_block(statements),
+        }
     }
 }
 

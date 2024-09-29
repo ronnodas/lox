@@ -8,18 +8,14 @@ use std::iter::Peekable;
 use miette::Diagnostic;
 use thiserror::Error;
 
-use ast::{Ast, Atom, Binary, Bp, Grouping, Node, Prefix, Value};
+use ast::{Atom, Binary, Bp, Expression, ExpressionNode, Prefix, Statement, StatementNode, Value};
 pub use span::Span;
 use tokenizer::{
     Error as TokenError, ErrorKind as TokenErrorKind, Token, TokenKind, TokenTag, Tokenizer,
 };
 
-type AstResult = Result<Option<Node>, ParseError>;
-
 const EXPRESSION_START: &str = "a new expression";
-const STATEMENT_START: &str = "a new statement";
 const STATEMENT_END: &str = "a ; or a }";
-const IDENTIFIER: &str = "an identifier";
 
 pub const INFIX_DOT_BINDING_POWER: (u8, u8) = (21, 22);
 pub const INFIX_CALL_BINDING_POWER: (u8, u8) = (19, 20);
@@ -31,86 +27,52 @@ pub const INFIX_EQUALITY_BINDING_POWER: (u8, u8) = (9, 10);
 pub const INFIX_AND_BINDING_POWER: (u8, u8) = (7, 8);
 pub const INFIX_OR_BINDING_POWER: (u8, u8) = (5, 6);
 pub const INFIX_ASSIGNMENT_BINDING_POWER: (u8, u8) = (4, 3);
-pub const PREFIX_PRINT_BINDING_POWER: u8 = 1;
 
 pub struct Parser<'t> {
-    source: &'t str,
     tokens: Peekable<Tokenizer<'t>>,
 }
 
 impl<'t> Parser<'t> {
     pub fn new(source: &'t str) -> Self {
         Self {
-            source,
             tokens: Tokenizer::new(source).peekable(),
         }
     }
 
-    #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
-    fn parse(&mut self, binding_power: Bp, break_on: &[TokenTag]) -> AstResult {
+    // #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
+    fn parse_statement(
+        &mut self,
+        break_on: &[TokenTag],
+    ) -> Result<Option<StatementNode>, ParseError> {
         if self.matches_next(break_on) {
             return Ok(None);
         }
         let Token {
             kind: start,
             mut span,
-        } = match self.tokens.next() {
-            Some(token) => token?,
+        } = match self.tokens.peek() {
+            Some(token) => token.as_ref()?,
             None => return Ok(None),
         };
-        let Some(start) = Start::new(start) else {
-            return Err(WithSpan::new(ErrorKind::UnexpectedToken(EXPRESSION_START), span).into());
+        let Some(start) = StatementStart::new(start) else {
+            let expression = self.parse_expression(0, break_on)?;
+            let Some(expression) = expression else {
+                _ = self.expect(TokenTag::Semicolon)?;
+                return Ok(None);
+            };
+            let span = expression.span;
+            return Ok(Some(StatementNode {
+                statement: Statement::Expression(expression),
+                span,
+            }));
         };
+        _ = self.tokens.next();
         match start {
-            Start::Atom(atom) => {
-                let mut node = Ast::Atom(atom);
-                loop {
-                    let Some(Ok(op)) = self.tokens.peek() else {
-                        break;
-                    };
-                    let Some((op, left_bp, right_bp)) = Infix::new(op.kind) else {
-                        break;
-                    };
-                    if left_bp <= binding_power {
-                        break;
-                    }
-                    _ = self.tokens.next();
-                    let Some(right) = self.parse(right_bp, break_on)? else {
-                        return Err(ParseError::UnexpectedEndOfInput(EXPRESSION_START));
-                    };
-                    let right_span = right.span;
-                    node = match op {
-                        Infix::Op(op) => {
-                            Ast::Binary(op, Box::new([Node { ast: node, span }, right]))
-                        }
-                        Infix::Assignment => {
-                            let lvalue = node
-                                .lvalue()
-                                .ok_or_else(|| ErrorKind::InvalidLValue.with_span(span))?;
-                            Ast::Assignment(lvalue, Box::new(right))
-                        }
-                    };
-                    span |= right_span;
-                }
-                //TODO handle postfix
-                Ok(Some(Node { ast: node, span }))
-            }
-            Start::Prefix(op) => match self.parse(op.right_binding_power(), break_on)? {
-                Some(right) => {
-                    let right_span = right.span;
-                    Ok(Some(Node {
-                        ast: Ast::Prefix(op, Box::new(right)),
-                        span: span | right_span,
-                    }))
-                }
-                _ => Err(WithSpan::new(ErrorKind::UnexpectedToken(EXPRESSION_START), span).into()),
-            },
-            Start::Group(Grouping::Brace) => {
+            StatementStart::Block => {
                 let mut items = Vec::new();
                 loop {
-                    dbg!(&items);
                     if let Some(node) =
-                        self.parse(0, &[TokenTag::Semicolon, TokenTag::RightBrace])?
+                        self.parse_statement(&[TokenTag::Semicolon, TokenTag::RightBrace])?
                     {
                         span |= node.span;
                         items.push(node);
@@ -134,73 +96,138 @@ impl<'t> Parser<'t> {
                         None => return Err(ParseError::UnexpectedEndOfInput(STATEMENT_END)),
                     }
                 }
-                Ok(Some(Node {
-                    ast: Ast::Group(Grouping::Brace, items),
+                Ok(Some(StatementNode {
+                    statement: Statement::Block(items),
                     span,
                 }))
             }
-            Start::Unary(marker) => {
-                let (end, consume) = marker.terminator();
-                let one = self.parse(0, end)?;
-                if consume {
-                    for &terminator in end {
-                        span |= self.expect(terminator)?.span;
-                    }
-                }
+            StatementStart::Prefix(marker) => {
+                let one = self.parse_expression(0, &[])?;
                 marker.form(one, span).map(Some)
             }
-            Start::For => {
+            StatementStart::For => {
                 _ = self.expect(TokenTag::LeftParen)?;
-                let initialization = self.parse(0, &[TokenTag::Semicolon])?;
+                let initialization = self.parse_statement(&[TokenTag::Semicolon])?;
                 _ = self.expect(TokenTag::Semicolon)?;
-                let condition = Box::new(self.parse(0, &[TokenTag::Semicolon])?.unwrap_or(Node {
-                    ast: Ast::Atom(Atom::Value(Value::Boolean(true))),
-                    span: (0, 0).into(),
-                }));
+                let condition = self.parse_expression(0, &[TokenTag::Semicolon])?;
                 _ = self.expect(TokenTag::Semicolon)?;
-                let increment = self.parse(0, &[TokenTag::RightParen])?.map(Box::new);
+                let increment = self.parse_expression(0, &[TokenTag::RightParen])?;
                 _ = self.expect(TokenTag::RightParen)?;
-                let body = Box::new(self.parse(binding_power, break_on)?.ok_or_else(|| {
+                let body = self.parse_statement(break_on)?.ok_or_else(|| {
                     ErrorKind::SyntaxError("for loop must have a body").with_span(span)
-                })?);
+                })?;
                 span |= body.span;
-                let for_node = Node {
-                    ast: Ast::For {
-                        condition,
-                        increment,
-                        body,
-                    },
-                    span,
-                };
-                let block = match initialization {
-                    Some(initialization) => {
-                        vec![initialization, for_node]
-                    }
-                    None => vec![for_node],
-                };
-                Ok(Some(Node {
-                    ast: Ast::Group(Grouping::Brace, block),
+                Ok(Some(StatementNode {
+                    statement: Self::desugar_for(initialization, condition, increment, body)?,
                     span,
                 }))
             }
-            Start::While => {
+            StatementStart::While => {
                 _ = self.expect(TokenTag::LeftParen)?;
-                let condition =
-                    Box::new(self.parse(0, &[TokenTag::Semicolon])?.ok_or_else(|| {
+                let condition = self
+                    .parse_expression(0, &[TokenTag::Semicolon])?
+                    .ok_or_else(|| {
                         ErrorKind::SyntaxError("while loop must have non-empty condition")
                             .with_span(span)
-                    })?);
+                    })?;
                 _ = self.expect(TokenTag::RightParen)?;
-                let body = Box::new(self.parse(binding_power, break_on)?.ok_or_else(|| {
+                let body = Box::new(self.parse_statement(break_on)?.ok_or_else(|| {
                     ErrorKind::SyntaxError("while loop must have a body").with_span(span)
                 })?);
                 span |= body.span;
-                Ok(Some(Node {
-                    ast: Ast::For {
-                        condition,
-                        increment: None,
-                        body,
-                    },
+                Ok(Some(StatementNode {
+                    statement: Statement::While { condition, body },
+                    span,
+                }))
+            }
+        }
+    }
+
+    // #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
+    fn parse_expression(
+        &mut self,
+        binding_power: Bp,
+        break_on: &[TokenTag],
+    ) -> Result<Option<ExpressionNode>, ParseError> {
+        if self.matches_next(break_on) {
+            return Ok(None);
+        }
+        let Token {
+            kind: start,
+            mut span,
+        } = match self.tokens.next() {
+            Some(token) => token?,
+            None => return Ok(None),
+        };
+        let Some(start) = ExpressionStart::new(start) else {
+            return Err(WithSpan::new(ErrorKind::UnexpectedToken(EXPRESSION_START), span).into());
+        };
+        match start {
+            ExpressionStart::Atom(atom) => {
+                let mut node = Expression::Atom(atom);
+                loop {
+                    let Some(Ok(op)) = self.tokens.peek() else {
+                        break;
+                    };
+                    let Some((op, left_bp, right_bp)) = Infix::new(op.kind) else {
+                        break;
+                    };
+                    if left_bp <= binding_power {
+                        break;
+                    }
+                    _ = self.tokens.next();
+                    let Some(right) = self.parse_expression(right_bp, break_on)? else {
+                        return Err(ParseError::UnexpectedEndOfInput(EXPRESSION_START));
+                    };
+                    let right_span = right.span;
+                    node = match op {
+                        Infix::Op(op) => Expression::Binary(
+                            op,
+                            Box::new([
+                                ExpressionNode {
+                                    expression: node,
+                                    span,
+                                },
+                                right,
+                            ]),
+                        ),
+                        Infix::Assignment => {
+                            let lvalue = node
+                                .lvalue()
+                                .ok_or_else(|| ErrorKind::InvalidLValue.with_span(span))?;
+                            Expression::Assignment(lvalue, Box::new(right))
+                        }
+                    };
+                    span |= right_span;
+                }
+                //TODO handle postfix
+                Ok(Some(ExpressionNode {
+                    expression: node,
+                    span,
+                }))
+            }
+            ExpressionStart::Prefix(op) => match self
+                .parse_expression(op.right_binding_power(), break_on)?
+            {
+                Some(right) => {
+                    let right_span = right.span;
+                    Ok(Some(ExpressionNode {
+                        expression: Expression::Prefix(op, Box::new(right)),
+                        span: span | right_span,
+                    }))
+                }
+                _ => Err(WithSpan::new(ErrorKind::UnexpectedToken(EXPRESSION_START), span).into()),
+            },
+            ExpressionStart::Paren => {
+                let one = self.parse_expression(0, &[(TokenTag::RightParen)])?;
+                span |= self.expect(TokenTag::RightParen)?.span;
+
+                let one = one.ok_or_else(|| {
+                    ErrorKind::SyntaxError("empty parentheses are only allowed in a function call")
+                        .with_span(span)
+                })?;
+                Ok(Some(ExpressionNode {
+                    expression: Expression::Parenthesized(Box::new(one)),
                     span,
                 }))
             }
@@ -225,92 +252,136 @@ impl<'t> Parser<'t> {
             None => Err(ParseError::UnexpectedEndOfInput(terminator.description())),
         }
     }
+
+    fn desugar_for(
+        initialization: Option<StatementNode>,
+        condition: Option<ExpressionNode>,
+        increment: Option<ExpressionNode>,
+        body: StatementNode,
+    ) -> Result<Statement, ParseError> {
+        let body = match increment {
+            Some(increment) => {
+                let span = increment.span;
+                let increment = StatementNode {
+                    statement: Statement::Expression(increment),
+                    span,
+                };
+                let span = body.span | increment.span;
+                StatementNode {
+                    statement: Statement::Block(vec![body, increment]),
+                    span,
+                }
+            }
+            None => body,
+        };
+        let condition = condition.unwrap_or(ExpressionNode {
+            expression: Expression::Atom(Atom::Value(Value::Boolean(true))),
+            span: (0, 0).into(),
+        });
+        let span = body.span | condition.span;
+        let while_statement = StatementNode {
+            statement: Statement::While {
+                condition,
+                body: Box::new(body),
+            },
+            span,
+        };
+        Ok(match initialization {
+            Some(
+                initialization @ StatementNode {
+                    statement:
+                        Statement::Declaration(..)
+                        | Statement::Expression(ExpressionNode {
+                            expression: Expression::Assignment(..),
+                            ..
+                        }),
+                    ..
+                },
+            ) => Statement::Block(vec![initialization, while_statement]),
+            Some(initialization) => {
+                return Err(ErrorKind::SyntaxError(
+                    "initializer in for loop must be either a declaration or assignment",
+                )
+                .with_span(initialization.span)
+                .into())
+            }
+            None => while_statement.statement,
+        })
+    }
 }
 
 impl<'t> Iterator for Parser<'t> {
-    type Item = Result<Node, ParseError>;
+    type Item = Result<StatementNode, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // TODO return spans for better errors
-        let node = self.parse(0, &[]).transpose()?;
+        let node = self.parse_statement(&[]).transpose()?;
         _ = self.expect(TokenTag::Semicolon);
         Some(node)
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Start {
-    Atom(Atom),
-    Prefix(Prefix),
-    Group(Grouping),
-    Unary(FancyUnary),
+enum StatementStart {
+    Prefix(ExpressionPrefix),
     For,
     While,
+    Block,
 }
 
-impl Start {
-    pub fn new(kind: TokenKind) -> Option<Self> {
-        Atom::from_token(kind)
-            .map(Self::Atom)
-            .or_else(|| Prefix::from_token(kind).map(Self::Prefix))
-            .or_else(|| match kind {
-                TokenKind::LeftBrace => Some(Self::Group(Grouping::Brace)),
-                TokenKind::Var => Some(Self::Unary(FancyUnary::Var)),
-                TokenKind::LeftParen => Some(Self::Unary(FancyUnary::LeftParen)),
-                TokenKind::For => Some(Self::For),
-                TokenKind::While => Some(Self::While),
-                TokenKind::RightParen
-                | TokenKind::RightBrace
-                | TokenKind::Comma
-                | TokenKind::Dot
-                | TokenKind::Minus
-                | TokenKind::Plus
-                | TokenKind::Semicolon
-                | TokenKind::Slash
-                | TokenKind::Star
-                | TokenKind::Bang
-                | TokenKind::BangEqual
-                | TokenKind::Equal
-                | TokenKind::EqualEqual
-                | TokenKind::Greater
-                | TokenKind::GreaterEqual
-                | TokenKind::Less
-                | TokenKind::LessEqual
-                | TokenKind::Identifier(_)
-                | TokenKind::String(_)
-                | TokenKind::Number(_)
-                | TokenKind::And
-                | TokenKind::Class
-                | TokenKind::Else
-                | TokenKind::False
-                | TokenKind::Fun
-                | TokenKind::If
-                | TokenKind::Nil
-                | TokenKind::Or
-                | TokenKind::Print
-                | TokenKind::Return
-                | TokenKind::Super
-                | TokenKind::This
-                | TokenKind::True => None,
-            })
+impl StatementStart {
+    pub const fn new(kind: &TokenKind) -> Option<Self> {
+        match kind {
+            TokenKind::LeftBrace => Some(Self::Block),
+            TokenKind::Var => Some(Self::Prefix(ExpressionPrefix::Var)),
+            TokenKind::Print => Some(Self::Prefix(ExpressionPrefix::Print)),
+            TokenKind::For => Some(Self::For),
+            TokenKind::While => Some(Self::While),
+            TokenKind::LeftParen
+            | TokenKind::RightParen
+            | TokenKind::RightBrace
+            | TokenKind::Comma
+            | TokenKind::Dot
+            | TokenKind::Minus
+            | TokenKind::Plus
+            | TokenKind::Semicolon
+            | TokenKind::Slash
+            | TokenKind::Star
+            | TokenKind::Bang
+            | TokenKind::BangEqual
+            | TokenKind::Equal
+            | TokenKind::EqualEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterEqual
+            | TokenKind::Less
+            | TokenKind::LessEqual
+            | TokenKind::Identifier(_)
+            | TokenKind::String(_)
+            | TokenKind::Number(_)
+            | TokenKind::And
+            | TokenKind::Class
+            | TokenKind::Else
+            | TokenKind::False
+            | TokenKind::Fun
+            | TokenKind::If
+            | TokenKind::Nil
+            | TokenKind::Or
+            | TokenKind::Return
+            | TokenKind::Super
+            | TokenKind::This
+            | TokenKind::True => None,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FancyUnary {
+enum ExpressionPrefix {
     Var,
-    LeftParen,
+    Print,
 }
 
-impl FancyUnary {
-    const fn terminator(&self) -> (&[TokenTag], bool) {
-        match self {
-            Self::Var => (&[TokenTag::Semicolon], false),
-            Self::LeftParen => (&[TokenTag::RightParen], true),
-        }
-    }
-
-    fn form(self, one: Option<Node>, span: Span) -> Result<Node, ParseError> {
+impl ExpressionPrefix {
+    fn form(self, one: Option<ExpressionNode>, span: Span) -> Result<StatementNode, ParseError> {
         match self {
             Self::Var => {
                 let one = one.ok_or_else(|| {
@@ -318,11 +389,17 @@ impl FancyUnary {
                         .with_span(span)
                 })?;
 
-                let ast = match one.ast.unparen() {
-                    Ast::Assignment(left, right) => Ast::Declaration(left, Some(right)),
-                    Ast::Atom(Atom::Identifier(identifier)) => Ast::Declaration(identifier, None),
-                    Ast::Parenthesized(..) => unreachable!("called unparen()"),
-                    _ => {
+                let statement = match one.expression {
+                    Expression::Assignment(left, right) => {
+                        Statement::Declaration(left, Some(*right))
+                    }
+                    Expression::Atom(Atom::Identifier(identifier)) => {
+                        Statement::Declaration(identifier, None)
+                    }
+                    Expression::Atom(_)
+                    | Expression::Prefix(..)
+                    | Expression::Binary(..)
+                    | Expression::Parenthesized(_) => {
                         return Err(ErrorKind::SyntaxError(
                             "`var` must be followed by a variable or assignment",
                         )
@@ -330,20 +407,34 @@ impl FancyUnary {
                         .into())
                     }
                 };
-                let ast = ast;
-                Ok(Node { ast, span })
+                Ok(StatementNode { statement, span })
             }
-            Self::LeftParen => {
+            Self::Print => {
                 let one = one.ok_or_else(|| {
-                    ErrorKind::SyntaxError("empty parentheses are only allowed in a function call")
-                        .with_span(span)
+                    ErrorKind::SyntaxError("print requires an argument").with_span(span)
                 })?;
-                Ok(Node {
-                    ast: Ast::Parenthesized(Box::new(one)),
+                Ok(StatementNode {
+                    statement: Statement::Print(one),
                     span,
                 })
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ExpressionStart {
+    Atom(Atom),
+    Prefix(Prefix),
+    Paren,
+}
+
+impl ExpressionStart {
+    pub fn new(kind: TokenKind) -> Option<Self> {
+        Atom::from_token(kind)
+            .map(Self::Atom)
+            .or_else(|| Prefix::from_token(kind).map(Self::Prefix))
+            .or_else(|| (kind == TokenKind::LeftParen).then_some(Self::Paren))
     }
 }
 
@@ -400,10 +491,6 @@ pub enum ErrorKind {
     TokenizingError(#[from] TokenErrorKind),
     #[error("Unexpected token while parsing, expecting {0}")]
     UnexpectedToken(&'static str),
-    #[error("Unmatched parenthesis")]
-    UnmatchedParen,
-    #[error("Unterminated print statement")]
-    UnterminatedPrint,
     #[error("Syntax error: {0}")]
     SyntaxError(&'static str),
     #[error("Invalid l-value")]
@@ -414,8 +501,6 @@ impl ErrorKind {
     const fn label(&self) -> &'static str {
         match self {
             Self::UnexpectedToken(_) => "this token",
-            Self::UnmatchedParen => "this open parenthesis",
-            Self::UnterminatedPrint => "print starts here",
             Self::InvalidLValue => "this expression cannot be assigned to",
             Self::SyntaxError(_) => "in this expression",
             Self::TokenizingError(_) => "",
@@ -441,17 +526,15 @@ impl From<&TokenError> for ParseError {
 
 #[cfg(test)]
 mod tests {
-    use itertools::Itertools as _;
 
     use super::*;
 
-    fn test_parse(source: &str) -> miette::Result<()> {
-        let ast: Vec<Node> = Parser::new(source)
-            .try_collect()
-            .map_err(|e| miette::Report::from(e).with_source_code(source.to_owned()))?;
-        assert_eq!(ast.len(), 1);
-        let ast = ast.into_iter().next().unwrap();
-        assert_eq!(source, ast.to_string(), "{ast:?}");
+    fn test_expression_parse(source: &str) -> miette::Result<()> {
+        let expression = Parser::new(source)
+            .parse_expression(0, &[])
+            .map_err(|e| miette::Report::from(e).with_source_code(source.to_owned()))?
+            .unwrap();
+        assert_eq!(source, expression.to_string(), "{expression:?}");
         Ok(())
     }
 
@@ -467,7 +550,7 @@ mod tests {
             "false",
             "nil",
         ] {
-            if let Err(e) = test_parse(source) {
+            if let Err(e) = test_expression_parse(source) {
                 eprintln!("failed to parse '{source}': {e:?}");
                 panic!();
             }
@@ -482,7 +565,7 @@ mod tests {
             "1 + 2 + 3 + 4",
             "1 - 2 + 3 - 4",
         ] {
-            if let Err(e) = test_parse(source) {
+            if let Err(e) = test_expression_parse(source) {
                 eprintln!("failed to parse '{source}': {e:?}");
                 panic!();
             }
@@ -497,7 +580,7 @@ mod tests {
             "1 * 2 * 3 / 4",
             "1 / 2 + 3 / 4",
         ] {
-            if let Err(e) = test_parse(source) {
+            if let Err(e) = test_expression_parse(source) {
                 eprintln!("failed to parse '{source}': {e:?}");
                 panic!();
             }

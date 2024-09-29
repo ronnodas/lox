@@ -1,7 +1,8 @@
 use std::fmt::{self, Display};
 
 use super::ast::{
-    Arithmetic, Atom, Binary, Comparison, Equality, Grouping, Logical, Node, Prefix, Value, Visitor,
+    Arithmetic, Atom, Binary, Comparison, Equality, ExpressionNode, ExpressionVisitor, Logical,
+    Prefix, Value,
 };
 use super::Span;
 
@@ -9,7 +10,7 @@ struct Printer<'a, 'f> {
     formatter: &'a mut fmt::Formatter<'f>,
 }
 
-impl<'a, 'f> Visitor for Printer<'a, 'f> {
+impl<'a, 'f> ExpressionVisitor for Printer<'a, 'f> {
     type Output = ();
     type Error = fmt::Error;
 
@@ -20,8 +21,7 @@ impl<'a, 'f> Visitor for Printer<'a, 'f> {
     fn visit_prefix(
         &mut self,
         op: Prefix,
-        arg: &Node,
-        _span: Span,
+        arg: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error> {
         write!(self.formatter, "{op}{arg}")
     }
@@ -29,77 +29,28 @@ impl<'a, 'f> Visitor for Printer<'a, 'f> {
     fn visit_binary(
         &mut self,
         op: Binary,
-        [left, right]: &[Node; 2],
-        _span: Span,
+        [left, right]: &[ExpressionNode; 2],
     ) -> Result<Self::Output, Self::Error> {
         write!(self.formatter, "{left} {op} {right}")
-    }
-
-    fn visit_group(
-        &mut self,
-        grouping: Grouping,
-        items: &[Node],
-        _span: Span,
-    ) -> Result<Self::Output, Self::Error> {
-        match grouping {
-            Grouping::Brace => {
-                write!(self.formatter, "{{")?;
-                items
-                    .iter()
-                    .try_for_each(|arg| write!(self.formatter, "{arg}; "))?;
-                write!(self.formatter, "}}")
-            }
-        }
     }
 
     fn visit_assignment(
         &mut self,
         left: &super::ast::LValue,
-        right: &Node,
-        _span: Span,
+        right: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error> {
         write!(self.formatter, "{left} = {right}")
     }
 
-    fn visit_declaration(
-        &mut self,
-        identifier: &super::ast::Identifier,
-        initializer: Option<&Node>,
-        _span: Span,
-    ) -> Result<Self::Output, Self::Error> {
-        match initializer {
-            Some(initializer) => write!(self.formatter, "var {identifier} = {initializer};"),
-            None => write!(self.formatter, "var {identifier};"),
-        }
-    }
-
     fn visit_parenthesized(
         &mut self,
-        node: &Node,
-        _span: Span,
+        node: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error> {
         write!(self.formatter, "({node})")
     }
-
-    fn visit_for(
-        &mut self,
-        condition: &Node,
-        body: &Node,
-        increment: Option<&Node>,
-        _span: Span,
-    ) -> Result<Self::Output, Self::Error> {
-        match increment {
-            Some(increment) => {
-                write!(self.formatter, "for (;{condition}; {increment}) {body}")
-            }
-            None => {
-                write!(self.formatter, "for (; {condition};) {body}")
-            }
-        }
-    }
 }
 
-impl Display for Node {
+impl Display for ExpressionNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.host(&mut (Printer { formatter: f }))
     }
@@ -137,7 +88,6 @@ impl Display for Prefix {
         let string = match self {
             Self::Minus => "-",
             Self::Not => "!",
-            Self::Print => "print ",
         };
         write!(f, "{string}")
     }
