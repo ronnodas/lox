@@ -132,6 +132,7 @@ impl ExpressionVisitor for Interpreter {
                 let right = right.host(self)?;
                 op.evaluate(left, right).map_err(RuntimeError::from)
             }
+            Binary::Field => todo!(),
         }
     }
 
@@ -145,6 +146,14 @@ impl ExpressionVisitor for Interpreter {
             .set(left, value.clone())
             .ok_or(RuntimeError::UndeclaredVariable(Identifier::clone(left)))?;
         Ok(value)
+    }
+
+    fn visit_call(
+        &mut self,
+        callee: &ExpressionNode,
+        args: &[ExpressionNode],
+    ) -> Result<Self::Output, Self::Error> {
+        todo!()
     }
 }
 

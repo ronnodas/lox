@@ -5,9 +5,9 @@ use thiserror::Error;
 use super::span::Span;
 use super::tokenizer::TokenKind;
 use super::{
-    INFIX_AND_BINDING_POWER, INFIX_COMPARISON_BINDING_POWER, INFIX_EQUALITY_BINDING_POWER,
-    INFIX_OR_BINDING_POWER, INFIX_PRODUCT_BINDING_POWER, INFIX_SUM_BINDING_POWER,
-    PREFIX_MINUS_NOT_BINDING_POWER,
+    INFIX_AND_BINDING_POWER, INFIX_COMPARISON_BINDING_POWER, INFIX_DOT_BINDING_POWER,
+    INFIX_EQUALITY_BINDING_POWER, INFIX_OR_BINDING_POWER, INFIX_PRODUCT_BINDING_POWER,
+    INFIX_SUM_BINDING_POWER, PREFIX_MINUS_NOT_BINDING_POWER,
 };
 
 pub type Identifier = Arc<str>;
@@ -70,17 +70,20 @@ pub enum Expression {
     Binary(Binary, Box<[ExpressionNode; 2]>),
     Parenthesized(Box<ExpressionNode>),
     Assignment(LValue, Box<ExpressionNode>),
+    Call(Box<ExpressionNode>, Vec<ExpressionNode>),
 }
 
 impl Expression {
     pub fn lvalue(&self) -> Option<LValue> {
         match &self {
             Self::Atom(Atom::Identifier(identifier)) => Some(Identifier::clone(identifier)),
+            Self::Binary(Binary::Field, ..) => todo!(),
             Self::Atom(_)
             | Self::Prefix(..)
             | Self::Binary(..)
             | Self::Parenthesized(_)
-            | Self::Assignment(..) => None,
+            | Self::Assignment(..)
+            | Self::Call(..) => None,
         }
     }
 }
@@ -111,6 +114,7 @@ pub enum Value {
 }
 
 impl Value {
+    #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
     fn from_token(token: TokenKind) -> Option<Self> {
         let value = match token {
             TokenKind::Number(number) => Self::Number(number),
@@ -118,39 +122,7 @@ impl Value {
             TokenKind::True => Self::Boolean(true),
             TokenKind::Nil => Self::Nil,
             TokenKind::String(string) => Self::string(string),
-            TokenKind::LeftParen
-            | TokenKind::RightParen
-            | TokenKind::LeftBrace
-            | TokenKind::RightBrace
-            | TokenKind::Comma
-            | TokenKind::Dot
-            | TokenKind::Minus
-            | TokenKind::Plus
-            | TokenKind::Semicolon
-            | TokenKind::Slash
-            | TokenKind::Star
-            | TokenKind::Bang
-            | TokenKind::BangEqual
-            | TokenKind::Equal
-            | TokenKind::EqualEqual
-            | TokenKind::Greater
-            | TokenKind::GreaterEqual
-            | TokenKind::Less
-            | TokenKind::LessEqual
-            | TokenKind::Identifier(_)
-            | TokenKind::And
-            | TokenKind::Class
-            | TokenKind::Else
-            | TokenKind::For
-            | TokenKind::Fun
-            | TokenKind::If
-            | TokenKind::Or
-            | TokenKind::Print
-            | TokenKind::Return
-            | TokenKind::Super
-            | TokenKind::This
-            | TokenKind::Var
-            | TokenKind::While => return None,
+            _ => return None,
         };
         Some(value)
     }
@@ -205,47 +177,12 @@ impl Prefix {
         }
     }
 
+    #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
     pub const fn from_token(token: TokenKind) -> Option<Self> {
         let op = match token {
             TokenKind::Minus => Self::Minus,
             TokenKind::Bang => Self::Not,
-
-            TokenKind::LeftParen
-            | TokenKind::RightParen
-            | TokenKind::LeftBrace
-            | TokenKind::RightBrace
-            | TokenKind::Comma
-            | TokenKind::Dot
-            | TokenKind::Plus
-            | TokenKind::Semicolon
-            | TokenKind::Slash
-            | TokenKind::Star
-            | TokenKind::BangEqual
-            | TokenKind::Equal
-            | TokenKind::EqualEqual
-            | TokenKind::Greater
-            | TokenKind::GreaterEqual
-            | TokenKind::Less
-            | TokenKind::LessEqual
-            | TokenKind::Identifier(_)
-            | TokenKind::String(_)
-            | TokenKind::Number(_)
-            | TokenKind::And
-            | TokenKind::Class
-            | TokenKind::Else
-            | TokenKind::False
-            | TokenKind::For
-            | TokenKind::Fun
-            | TokenKind::If
-            | TokenKind::Nil
-            | TokenKind::Or
-            | TokenKind::Print
-            | TokenKind::Return
-            | TokenKind::Super
-            | TokenKind::This
-            | TokenKind::True
-            | TokenKind::Var
-            | TokenKind::While => return None,
+            _ => return None,
         };
         Some(op)
     }
@@ -253,6 +190,7 @@ impl Prefix {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Binary {
+    Field,
     Arithmetic(Arithmetic),
     Comparison(Comparison),
     Equality(Equality),
@@ -262,6 +200,7 @@ pub enum Binary {
 impl Binary {
     pub fn evaluate(self, left: Value, right: Value) -> Result<Value, TypeError> {
         match self {
+            Self::Field => todo!(),
             Self::Arithmetic(op) => op.evaluate(left, right),
             Self::Comparison(rel) => rel.evaluate(left, right).map(Value::Boolean),
             Self::Equality(rel) => Ok(Value::Boolean(rel.evaluate(&left, &right))),
@@ -271,6 +210,7 @@ impl Binary {
 
     pub const fn binding_power(self) -> (u8, u8) {
         match self {
+            Self::Field => INFIX_DOT_BINDING_POWER,
             Self::Arithmetic(op) => op.binding_power(),
             Self::Comparison(_) => INFIX_COMPARISON_BINDING_POWER,
             Self::Equality(_) => INFIX_EQUALITY_BINDING_POWER,
@@ -278,6 +218,7 @@ impl Binary {
         }
     }
 
+    #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
     pub const fn from_token(token: TokenKind) -> Option<Self> {
         let op = match token {
             TokenKind::Plus => Self::Arithmetic(Arithmetic::Plus),
@@ -292,32 +233,8 @@ impl Binary {
             TokenKind::EqualEqual => Self::Equality(Equality::Equal),
             TokenKind::And => Self::Logical(Logical::And),
             TokenKind::Or => Self::Logical(Logical::Or),
-            TokenKind::LeftParen
-            | TokenKind::RightParen
-            | TokenKind::LeftBrace
-            | TokenKind::RightBrace
-            | TokenKind::Comma
-            | TokenKind::Dot
-            | TokenKind::Semicolon
-            | TokenKind::Bang
-            | TokenKind::Equal
-            | TokenKind::Identifier(_)
-            | TokenKind::String(_)
-            | TokenKind::Number(_)
-            | TokenKind::Class
-            | TokenKind::Else
-            | TokenKind::False
-            | TokenKind::For
-            | TokenKind::Fun
-            | TokenKind::If
-            | TokenKind::Nil
-            | TokenKind::Print
-            | TokenKind::Return
-            | TokenKind::Super
-            | TokenKind::This
-            | TokenKind::True
-            | TokenKind::Var
-            | TokenKind::While => return None,
+            TokenKind::Dot => Self::Field,
+            _ => return None,
         };
 
         Some(op)
@@ -461,6 +378,11 @@ pub trait ExpressionVisitor {
         left: &LValue,
         right: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error>;
+    fn visit_call(
+        &mut self,
+        callee: &ExpressionNode,
+        args: &[ExpressionNode],
+    ) -> Result<Self::Output, Self::Error>;
 
     fn visit(&mut self, node: &ExpressionNode) -> Result<Self::Output, Self::Error> {
         match &node.expression {
@@ -469,6 +391,7 @@ pub trait ExpressionVisitor {
             Expression::Binary(op, args) => self.visit_binary(*op, args),
             Expression::Assignment(left, right) => self.visit_assignment(left, right),
             Expression::Parenthesized(inner) => self.visit_parenthesized(inner),
+            Expression::Call(callee, args) => self.visit_call(callee, args),
         }
     }
 

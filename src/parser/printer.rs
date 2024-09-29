@@ -1,5 +1,7 @@
 use std::fmt::{self, Display};
 
+use itertools::Itertools as _;
+
 use super::ast::{
     Arithmetic, Atom, Binary, Comparison, Equality, ExpressionNode, ExpressionVisitor, Logical,
     Prefix, Value,
@@ -42,11 +44,18 @@ impl<'a, 'f> ExpressionVisitor for Printer<'a, 'f> {
         write!(self.formatter, "{left} = {right}")
     }
 
-    fn visit_parenthesized(
-        &mut self,
-        node: &ExpressionNode,
-    ) -> Result<Self::Output, Self::Error> {
+    fn visit_parenthesized(&mut self, node: &ExpressionNode) -> Result<Self::Output, Self::Error> {
         write!(self.formatter, "({node})")
+    }
+
+    fn visit_call(
+        &mut self,
+        callee: &ExpressionNode,
+        args: &[ExpressionNode],
+    ) -> Result<Self::Output, Self::Error> {
+        write!(self.formatter, "{callee}(")?;
+        args.iter().format(", ").fmt(self.formatter)?;
+        write!(self.formatter, ")")
     }
 }
 
@@ -96,6 +105,7 @@ impl Display for Prefix {
 impl Display for Binary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Field => write!(f, "."),
             Self::Arithmetic(arithmetic) => write!(f, "{arithmetic}"),
             Self::Comparison(comparison) => write!(f, "{comparison}"),
             Self::Equality(equality) => write!(f, "{equality}"),

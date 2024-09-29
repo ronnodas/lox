@@ -143,7 +143,7 @@ impl<'t> Parser<'t> {
         }
     }
 
-    // #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
+    #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
     fn parse_expression(
         &mut self,
         binding_power: Bp,
@@ -164,7 +164,7 @@ impl<'t> Parser<'t> {
         };
         match start {
             ExpressionStart::Atom(atom) => {
-                let mut node = Expression::Atom(atom);
+                let mut expression = Expression::Atom(atom);
                 loop {
                     let Some(Ok(op)) = self.tokens.peek() else {
                         break;
@@ -175,36 +175,71 @@ impl<'t> Parser<'t> {
                     if left_bp <= binding_power {
                         break;
                     }
-                    _ = self.tokens.next();
-                    let Some(right) = self.parse_expression(right_bp, break_on)? else {
-                        return Err(ParseError::UnexpectedEndOfInput(EXPRESSION_START));
-                    };
-                    let right_span = right.span;
-                    node = match op {
-                        Infix::Op(op) => Expression::Binary(
-                            op,
-                            Box::new([
-                                ExpressionNode {
-                                    expression: node,
+                    let mut right_span = self
+                        .tokens
+                        .next()
+                        .transpose()?
+                        .unwrap_or_else(|| unreachable!())
+                        .span;
+                    if op == Infix::Call {
+                        let mut args = Vec::new();
+                        loop {
+                            if let Some(node) =
+                                self.parse_expression(0, &[TokenTag::Comma, TokenTag::RightParen])?
+                            {
+                                args.push(node);
+                            };
+                            match self.tokens.peek().map(Result::as_ref).transpose()? {
+                                Some(Token {
+                                    kind: TokenKind::Comma,
+                                    ..
+                                }) => {
+                                    _ = self.tokens.next();
+                                }
+                                Some(Token {
+                                    kind: TokenKind::RightParen,
                                     span,
-                                },
-                                right,
-                            ]),
-                        ),
-                        Infix::Assignment => {
-                            let lvalue = node
-                                .lvalue()
-                                .ok_or_else(|| ErrorKind::InvalidLValue.with_span(span))?;
-                            Expression::Assignment(lvalue, Box::new(right))
+                                }) => {
+                                    right_span |= *span;
+                                    _ = self.tokens.next();
+                                    break;
+                                }
+                                Some(token) => {
+                                    return Err(ErrorKind::UnexpectedToken("a , or a )")
+                                        .with_span(token.span)
+                                        .into())
+                                }
+                                None => {
+                                    return Err(ParseError::UnexpectedEndOfInput("a , or a )"));
+                                }
+                            }
                         }
-                    };
-                    span |= right_span;
+                        expression =
+                            Expression::Call(Box::new(ExpressionNode { expression, span }), args);
+                        span |= right_span;
+                    } else {
+                        let Some(right) = self.parse_expression(right_bp, break_on)? else {
+                            return Err(ParseError::UnexpectedEndOfInput(EXPRESSION_START));
+                        };
+                        let right_span = right.span;
+                        expression = match op {
+                            Infix::Op(op) => Expression::Binary(
+                                op,
+                                Box::new([ExpressionNode { expression, span }, right]),
+                            ),
+                            Infix::Assignment => {
+                                let lvalue = expression
+                                    .lvalue()
+                                    .ok_or_else(|| ErrorKind::InvalidLValue.with_span(span))?;
+                                Expression::Assignment(lvalue, Box::new(right))
+                            }
+                            Infix::Call => unreachable!("outer if-else"),
+                        };
+                        span |= right_span;
+                    }
                 }
                 //TODO handle postfix
-                Ok(Some(ExpressionNode {
-                    expression: node,
-                    span,
-                }))
+                Ok(Some(ExpressionNode { expression, span }))
             }
             ExpressionStart::Prefix(op) => match self
                 .parse_expression(op.right_binding_power(), break_on)?
@@ -329,6 +364,7 @@ enum StatementStart {
     Block,
 }
 
+#[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
 impl StatementStart {
     pub const fn new(kind: &TokenKind) -> Option<Self> {
         match kind {
@@ -337,39 +373,7 @@ impl StatementStart {
             TokenKind::Print => Some(Self::Prefix(ExpressionPrefix::Print)),
             TokenKind::For => Some(Self::For),
             TokenKind::While => Some(Self::While),
-            TokenKind::LeftParen
-            | TokenKind::RightParen
-            | TokenKind::RightBrace
-            | TokenKind::Comma
-            | TokenKind::Dot
-            | TokenKind::Minus
-            | TokenKind::Plus
-            | TokenKind::Semicolon
-            | TokenKind::Slash
-            | TokenKind::Star
-            | TokenKind::Bang
-            | TokenKind::BangEqual
-            | TokenKind::Equal
-            | TokenKind::EqualEqual
-            | TokenKind::Greater
-            | TokenKind::GreaterEqual
-            | TokenKind::Less
-            | TokenKind::LessEqual
-            | TokenKind::Identifier(_)
-            | TokenKind::String(_)
-            | TokenKind::Number(_)
-            | TokenKind::And
-            | TokenKind::Class
-            | TokenKind::Else
-            | TokenKind::False
-            | TokenKind::Fun
-            | TokenKind::If
-            | TokenKind::Nil
-            | TokenKind::Or
-            | TokenKind::Return
-            | TokenKind::Super
-            | TokenKind::This
-            | TokenKind::True => None,
+            _ => None,
         }
     }
 }
@@ -381,15 +385,15 @@ enum ExpressionPrefix {
 }
 
 impl ExpressionPrefix {
-    fn form(self, one: Option<ExpressionNode>, span: Span) -> Result<StatementNode, ParseError> {
+    fn form(self, arg: Option<ExpressionNode>, span: Span) -> Result<StatementNode, ParseError> {
         match self {
             Self::Var => {
-                let one = one.ok_or_else(|| {
+                let arg = arg.ok_or_else(|| {
                     ErrorKind::SyntaxError("var should be followed by an identifier")
                         .with_span(span)
                 })?;
 
-                let statement = match one.expression {
+                let statement = match arg.expression {
                     Expression::Assignment(left, right) => {
                         Statement::Declaration(left, Some(*right))
                     }
@@ -399,7 +403,8 @@ impl ExpressionPrefix {
                     Expression::Atom(_)
                     | Expression::Prefix(..)
                     | Expression::Binary(..)
-                    | Expression::Parenthesized(_) => {
+                    | Expression::Parenthesized(_)
+                    | Expression::Call(..) => {
                         return Err(ErrorKind::SyntaxError(
                             "`var` must be followed by a variable or assignment",
                         )
@@ -410,7 +415,7 @@ impl ExpressionPrefix {
                 Ok(StatementNode { statement, span })
             }
             Self::Print => {
-                let one = one.ok_or_else(|| {
+                let one = arg.ok_or_else(|| {
                     ErrorKind::SyntaxError("print requires an argument").with_span(span)
                 })?;
                 Ok(StatementNode {
@@ -442,14 +447,23 @@ impl ExpressionStart {
 pub enum Infix {
     Op(Binary),
     Assignment,
+    Call,
 }
 
 impl Infix {
+    #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
     pub fn new(token: TokenKind) -> Option<(Self, Bp, Bp)> {
         Binary::from_token(token).map_or_else(
-            || {
-                let (left, right) = INFIX_ASSIGNMENT_BINDING_POWER;
-                (token == TokenKind::Equal).then_some((Self::Assignment, left, right))
+            || match token {
+                TokenKind::Equal => {
+                    let (left, right) = INFIX_ASSIGNMENT_BINDING_POWER;
+                    Some((Self::Assignment, left, right))
+                }
+                TokenKind::LeftParen => {
+                    let (left, right) = INFIX_CALL_BINDING_POWER;
+                    Some((Self::Call, left, right))
+                }
+                _ => None,
             },
             |op| {
                 let (left, right) = op.binding_power();
@@ -484,7 +498,6 @@ impl WithSpan {
     }
 }
 
-//TODO add expected token to UnexpectedToken, probably want to pull in strum
 #[derive(Clone, Debug, Diagnostic, Eq, Error, PartialEq)]
 pub enum ErrorKind {
     #[error(transparent)]
