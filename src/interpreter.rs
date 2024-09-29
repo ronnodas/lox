@@ -1,56 +1,56 @@
-mod environment;
+pub mod environment;
+pub mod value;
 
 use std::convert::Infallible;
-use std::{fmt, io};
+use std::{io, mem, time};
 
 use itertools::Itertools as _;
 use miette::Diagnostic;
 use thiserror::Error;
+use value::{Function, TypeError, Value};
 
 use crate::parser::ast::{
     Atom, Binary, ExpressionNode, ExpressionVisitor, Identifier, LValue, Prefix, StatementNode,
-    StatementVisitor, TypeError, Value,
+    StatementVisitor,
 };
 use crate::parser::{Parser, Span};
 use crate::LoxError;
 
+pub use environment::Clock;
 use environment::Environment;
 
 #[derive(Default)]
 pub struct Interpreter {
     environment: Environment,
+    prints: Vec<String>,
 }
 
 impl StatementVisitor for Interpreter {
-    type Output = Vec<String>;
-    type Error = RuntimeError;
+    type Output = ();
+    type Error = Control;
 
     fn visit_expression(
         &mut self,
         expression: &ExpressionNode,
     ) -> Result<Self::Output, Self::Error> {
         _ = expression.host(self)?;
-        Ok(vec![])
+        Ok(())
     }
 
     fn visit_print(&mut self, expression: &ExpressionNode) -> Result<Self::Output, Self::Error> {
         let value = expression.host(self)?;
-        Ok(vec![value.to_string()])
+        let string = value
+            .as_string()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        self.prints.push(string);
+        Ok(())
     }
 
     fn visit_block(&mut self, items: &[StatementNode]) -> Result<Self::Output, Self::Error> {
-        self.environment.push();
-        let output = items.iter().try_fold(
-            vec![],
-            |mut output, item| -> Result<Self::Output, Self::Error> {
-                let new_output = item.host(self)?;
-                output.extend(new_output);
-                Ok(output)
-            },
-        )?;
-        self.environment.pop();
-
-        Ok(output)
+        self.environment.block();
+        let output = items.iter().try_for_each(|item| item.host(self));
+        self.environment.end_block();
+        output
     }
 
     fn visit_declaration(
@@ -60,7 +60,23 @@ impl StatementVisitor for Interpreter {
     ) -> Result<Self::Output, Self::Error> {
         let value = initializer.map(|node| node.host(self)).transpose()?;
         self.environment.declare(identifier, value);
-        Ok(vec![])
+        Ok(())
+    }
+
+    fn visit_if(
+        &mut self,
+        condition: &ExpressionNode,
+        then_body: &StatementNode,
+        else_body: Option<&StatementNode>,
+    ) -> Result<Self::Output, Self::Error> {
+        let condition = condition.host(self)?;
+        if condition.is_truthy() {
+            then_body.host(self)
+        } else if let Some(else_body) = else_body {
+            else_body.host(self)
+        } else {
+            Ok(())
+        }
     }
 
     fn visit_while(
@@ -68,16 +84,39 @@ impl StatementVisitor for Interpreter {
         condition: &ExpressionNode,
         body: &StatementNode,
     ) -> Result<Self::Output, Self::Error> {
-        let mut prints = vec![];
         loop {
             let condition = condition.host(self)?;
             if !condition.is_truthy() {
                 break;
             }
-            let print = body.host(self)?;
-            prints.extend(print);
+            body.host(self)?;
         }
-        Ok(prints)
+        Ok(())
+    }
+
+    fn visit_function_declaration(
+        &mut self,
+        name: &Identifier,
+        args: &[Identifier],
+        body: &StatementNode,
+    ) -> Result<Self::Output, Self::Error> {
+        let args = args.to_vec();
+        let body = Box::new(body.clone());
+        let function = Function {
+            name: Identifier::clone(name),
+            args,
+            body,
+            // TODO only capture variables appearing in body
+            closure: self.environment.capture().into(),
+        };
+        self.environment
+            .declare(name, Some(Value::function(function)));
+        Ok(())
+    }
+
+    fn visit_return(&mut self, expression: &ExpressionNode) -> Result<Self::Output, Self::Error> {
+        let value = expression.host(self)?;
+        Err(Control::Return(value))
     }
 }
 
@@ -87,14 +126,14 @@ impl ExpressionVisitor for Interpreter {
 
     fn visit_atom(&mut self, atom: &Atom, _span: Span) -> Result<Self::Output, Self::Error> {
         match atom {
-            Atom::Value(value) => Ok(value.clone()),
-            Atom::Identifier(identifier) => {
-                self.environment
-                    .get(identifier)
-                    .ok_or(RuntimeError::UndeclaredVariable(Identifier::clone(
-                        identifier,
-                    )))
-            }
+            Atom::Literal(value) => Ok(value.into()),
+            Atom::Identifier(identifier) => self
+                .environment
+                .get(identifier)
+                .ok_or(RuntimeError::UndeclaredVariable(Identifier::clone(
+                    identifier,
+                )))
+                .cloned(),
         }
     }
 
@@ -107,9 +146,9 @@ impl ExpressionVisitor for Interpreter {
         match op {
             Prefix::Minus => value
                 .float()
-                .map(|number| Value::Number(-number))
-                .ok_or_else(|| TypeError::UnaryMinus(value).into()),
-            Prefix::Not => Ok(Value::Boolean(!value.is_truthy())),
+                .map(|number| Value::number(-number))
+                .ok_or_else(|| TypeError::UnaryMinus(value.to_string()).into()),
+            Prefix::Not => Ok(Value::boolean(!value.is_truthy())),
         }
     }
 
@@ -153,7 +192,14 @@ impl ExpressionVisitor for Interpreter {
         callee: &ExpressionNode,
         args: &[ExpressionNode],
     ) -> Result<Self::Output, Self::Error> {
-        todo!()
+        let callee = callee.host(self)?;
+        let callee = callee.callable()?;
+        let args: Vec<Value> = args.iter().map(|arg| arg.host(self)).try_collect()?;
+        if callee.arity() == args.len() {
+            callee.call(self, args)
+        } else {
+            Err(RuntimeError::ArityMismatch(callee.arity(), args.len()))
+        }
     }
 }
 
@@ -165,8 +211,9 @@ impl Interpreter {
         statements
             .into_iter()
             .map(|statement| statement.host(self))
-            .flatten_ok()
-            .collect()
+            .try_for_each(|e| e)
+            .map_err(Control::outside)?;
+        Ok(mem::take(&mut self.prints))
     }
 
     pub fn run(&mut self, source: &str, print_last: bool) -> Result<Vec<String>, LoxError> {
@@ -232,15 +279,94 @@ impl Interpreter {
 
     pub fn new() -> Self {
         Self {
-            environment: Environment::default(),
+            environment: Environment::global(),
+            prints: Vec::new(),
+        }
+    }
+
+    fn function_call(
+        &mut self,
+        function: &Function,
+        args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        self.environment.push(function.closure.take());
+        for (name, value) in function.args.iter().zip(args) {
+            self.environment.declare(name, Some(value));
+        }
+        let output = match function.body.host(self) {
+            Ok(()) => Ok(Value::nil()),
+            Err(Control::Return(value)) => Ok(value),
+            Err(Control::Error(e)) => Err(e),
+        };
+        _ = function.closure.replace(self.environment.pop());
+        output
+    }
+}
+
+pub trait Callable {
+    fn call(&self, interpreter: &mut Interpreter, args: Vec<Value>) -> Result<Value, RuntimeError>;
+    fn arity(&self) -> usize;
+}
+
+impl Callable for Clock {
+    fn arity(&self) -> usize {
+        0
+    }
+
+    fn call(
+        &self,
+        _interpreter: &mut Interpreter,
+        _args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        Ok(Value::number(
+            time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+        ))
+    }
+}
+
+impl Callable for Function {
+    fn call(&self, interpreter: &mut Interpreter, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        interpreter.function_call(self, args)
+    }
+
+    fn arity(&self) -> usize {
+        self.args.len()
+    }
+}
+
+pub enum Control {
+    Error(RuntimeError),
+    Return(Value),
+}
+
+impl Control {
+    fn outside(self) -> RuntimeError {
+        match self {
+            Self::Error(v) => v,
+            Self::Return(_) => RuntimeError::ReturnOutsideFunction,
         }
     }
 }
 
-#[derive(Debug, Diagnostic, Error, PartialEq)]
+impl From<RuntimeError> for Control {
+    fn from(v: RuntimeError) -> Self {
+        Self::Error(v)
+    }
+}
+
+#[derive(Debug, Diagnostic, Error, PartialEq, Eq)]
 pub enum RuntimeError {
+    #[error(transparent)]
     Type(TypeError),
+    #[error("{0} is not defined")]
     UndeclaredVariable(Identifier),
+    #[error("Expected {0} arguments, got {1}")]
+    ArityMismatch(usize, usize),
+    #[error("Used return outside function")]
+    ReturnOutsideFunction,
 }
 
 impl From<Infallible> for RuntimeError {
@@ -252,14 +378,5 @@ impl From<Infallible> for RuntimeError {
 impl From<TypeError> for RuntimeError {
     fn from(v: TypeError) -> Self {
         Self::Type(v)
-    }
-}
-
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Type(error) => write!(f, "Type error: {error}"),
-            Self::UndeclaredVariable(identifer) => write!(f, "Undeclared variable: {identifer}"),
-        }
     }
 }

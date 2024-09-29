@@ -5,10 +5,14 @@ mod tokenizer;
 
 use std::iter::Peekable;
 
+use itertools::Itertools;
 use miette::Diagnostic;
 use thiserror::Error;
 
-use ast::{Atom, Binary, Bp, Expression, ExpressionNode, Prefix, Statement, StatementNode, Value};
+use ast::{
+    Atom, Binary, Bp, Expression, ExpressionNode, Identifier, Literal, Prefix, Statement,
+    StatementNode,
+};
 pub use span::Span;
 use tokenizer::{
     Error as TokenError, ErrorKind as TokenErrorKind, Token, TokenKind, TokenTag, Tokenizer,
@@ -39,7 +43,7 @@ impl<'t> Parser<'t> {
         }
     }
 
-    // #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
+    #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
     fn parse_statement(
         &mut self,
         break_on: &[TokenTag],
@@ -125,7 +129,7 @@ impl<'t> Parser<'t> {
             StatementStart::While => {
                 _ = self.expect(TokenTag::LeftParen)?;
                 let condition = self
-                    .parse_expression(0, &[TokenTag::Semicolon])?
+                    .parse_expression(0, &[TokenTag::RightParen])?
                     .ok_or_else(|| {
                         ErrorKind::SyntaxError("while loop must have non-empty condition")
                             .with_span(span)
@@ -140,10 +144,74 @@ impl<'t> Parser<'t> {
                     span,
                 }))
             }
+            StatementStart::Fun => {
+                let name = match self.parse_expression(0, &[TokenTag::LeftParen])? {
+                    Some(ExpressionNode {
+                        expression: Expression::Atom(Atom::Identifier(name)),
+                        ..
+                    }) => name,
+                    expression => {
+                        let span = expression.map_or(span, |expr| expr.span);
+                        return Err(
+                            ErrorKind::SyntaxError("function name must be an identifier")
+                                .with_span(span)
+                                .into(),
+                        );
+                    }
+                };
+                _ = self.expect(TokenTag::LeftParen)?;
+                let (params, _) = self.parse_args(span)?;
+                #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
+                let params: Vec<Identifier> = params
+                    .into_iter()
+                    .map(|expression| match expression.expression {
+                        Expression::Atom(Atom::Identifier(name)) => Ok(name),
+                        _ => Err(
+                            ErrorKind::SyntaxError("function parameters must be identifiers")
+                                .with_span(expression.span),
+                        ),
+                    })
+                    .try_collect()?;
+                let body = Box::new(self.parse_statement(break_on)?.ok_or_else(|| {
+                    ErrorKind::SyntaxError("function must have a body").with_span(span)
+                })?);
+                span |= body.span;
+                Ok(Some(StatementNode {
+                    statement: Statement::FunctionDeclaration(name, params, body),
+                    span,
+                }))
+            }
+            StatementStart::If => {
+                _ = self.expect(TokenTag::LeftParen)?;
+                let condition = self
+                    .parse_expression(0, &[TokenTag::RightParen])?
+                    .ok_or_else(|| {
+                        ErrorKind::SyntaxError("if statement must have non-empty condition")
+                            .with_span(span)
+                    })?;
+                _ = self.expect(TokenTag::RightParen)?;
+                let then_body = Box::new(self.parse_statement(break_on)?.ok_or_else(|| {
+                    ErrorKind::SyntaxError("while loop must have a body").with_span(span)
+                })?);
+                span |= then_body.span;
+                let else_body = if self.expect(TokenTag::Else).is_ok() {
+                    let else_body = self.parse_statement(break_on)?.ok_or_else(|| {
+                        ErrorKind::SyntaxError("while loop must have a body").with_span(span)
+                    })?;
+                    span |= else_body.span;
+                    Some(Box::new(else_body))
+                } else {
+                    None
+                };
+                Ok(Some(StatementNode {
+                    statement: Statement::If(condition, then_body, else_body),
+                    span,
+                }))
+            }
         }
     }
 
-    #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
+    // #[expect(clippy::too_many_lines, reason = "will refactor once complete")]
     fn parse_expression(
         &mut self,
         binding_power: Bp,
@@ -165,55 +233,24 @@ impl<'t> Parser<'t> {
         match start {
             ExpressionStart::Atom(atom) => {
                 let mut expression = Expression::Atom(atom);
-                loop {
-                    let Some(Ok(op)) = self.tokens.peek() else {
+                while let Some(Ok(op)) = self.tokens.peek() {
+                    if break_on.contains(&op.kind.into()) {
                         break;
-                    };
+                    }
                     let Some((op, left_bp, right_bp)) = Infix::new(op.kind) else {
                         break;
                     };
                     if left_bp <= binding_power {
                         break;
                     }
-                    let mut right_span = self
+                    let right_span = self
                         .tokens
                         .next()
                         .transpose()?
                         .unwrap_or_else(|| unreachable!())
                         .span;
                     if op == Infix::Call {
-                        let mut args = Vec::new();
-                        loop {
-                            if let Some(node) =
-                                self.parse_expression(0, &[TokenTag::Comma, TokenTag::RightParen])?
-                            {
-                                args.push(node);
-                            };
-                            match self.tokens.peek().map(Result::as_ref).transpose()? {
-                                Some(Token {
-                                    kind: TokenKind::Comma,
-                                    ..
-                                }) => {
-                                    _ = self.tokens.next();
-                                }
-                                Some(Token {
-                                    kind: TokenKind::RightParen,
-                                    span,
-                                }) => {
-                                    right_span |= *span;
-                                    _ = self.tokens.next();
-                                    break;
-                                }
-                                Some(token) => {
-                                    return Err(ErrorKind::UnexpectedToken("a , or a )")
-                                        .with_span(token.span)
-                                        .into())
-                                }
-                                None => {
-                                    return Err(ParseError::UnexpectedEndOfInput("a , or a )"));
-                                }
-                            }
-                        }
+                        let (args, right_span) = self.parse_args(right_span)?;
                         expression =
                             Expression::Call(Box::new(ExpressionNode { expression, span }), args);
                         span |= right_span;
@@ -221,7 +258,6 @@ impl<'t> Parser<'t> {
                         let Some(right) = self.parse_expression(right_bp, break_on)? else {
                             return Err(ParseError::UnexpectedEndOfInput(EXPRESSION_START));
                         };
-                        let right_span = right.span;
                         expression = match op {
                             Infix::Op(op) => Expression::Binary(
                                 op,
@@ -269,6 +305,44 @@ impl<'t> Parser<'t> {
         }
     }
 
+    fn parse_args(&mut self, mut span: Span) -> Result<(Vec<ExpressionNode>, Span), ParseError> {
+        let mut args = Vec::new();
+        loop {
+            if let Some(node) =
+                self.parse_expression(0, &[TokenTag::Comma, TokenTag::RightParen])?
+            {
+                args.push(node);
+            };
+            match self.tokens.peek().map(Result::as_ref).transpose()? {
+                Some(Token {
+                    kind: TokenKind::Comma,
+                    ..
+                }) => {
+                    _ = self.tokens.next();
+                }
+                Some(
+                    paren @ Token {
+                        kind: TokenKind::RightParen,
+                        ..
+                    },
+                ) => {
+                    span |= paren.span;
+                    _ = self.tokens.next();
+                    break;
+                }
+                Some(token) => {
+                    return Err(ErrorKind::UnexpectedToken("a , or a )")
+                        .with_span(token.span)
+                        .into())
+                }
+                None => {
+                    return Err(ParseError::UnexpectedEndOfInput("a , or a )"));
+                }
+            }
+        }
+        Ok((args, span))
+    }
+
     fn matches_next(&mut self, tags: &[TokenTag]) -> bool {
         self.tokens
             .peek()
@@ -310,7 +384,7 @@ impl<'t> Parser<'t> {
             None => body,
         };
         let condition = condition.unwrap_or(ExpressionNode {
-            expression: Expression::Atom(Atom::Value(Value::Boolean(true))),
+            expression: Expression::Atom(Atom::Literal(Literal::Boolean(true))),
             span: (0, 0).into(),
         });
         let span = body.span | condition.span;
@@ -359,9 +433,11 @@ impl<'t> Iterator for Parser<'t> {
 #[derive(Clone, Debug, PartialEq)]
 enum StatementStart {
     Prefix(ExpressionPrefix),
-    For,
+    If,
     While,
+    For,
     Block,
+    Fun,
 }
 
 #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
@@ -371,8 +447,11 @@ impl StatementStart {
             TokenKind::LeftBrace => Some(Self::Block),
             TokenKind::Var => Some(Self::Prefix(ExpressionPrefix::Var)),
             TokenKind::Print => Some(Self::Prefix(ExpressionPrefix::Print)),
-            TokenKind::For => Some(Self::For),
+            TokenKind::Return => Some(Self::Prefix(ExpressionPrefix::Return)),
+            TokenKind::If => Some(Self::If),
             TokenKind::While => Some(Self::While),
+            TokenKind::For => Some(Self::For),
+            TokenKind::Fun => Some(Self::Fun),
             _ => None,
         }
     }
@@ -382,6 +461,7 @@ impl StatementStart {
 enum ExpressionPrefix {
     Var,
     Print,
+    Return,
 }
 
 impl ExpressionPrefix {
@@ -415,11 +495,21 @@ impl ExpressionPrefix {
                 Ok(StatementNode { statement, span })
             }
             Self::Print => {
-                let one = arg.ok_or_else(|| {
+                let arg = arg.ok_or_else(|| {
                     ErrorKind::SyntaxError("print requires an argument").with_span(span)
                 })?;
                 Ok(StatementNode {
-                    statement: Statement::Print(one),
+                    statement: Statement::Print(arg),
+                    span,
+                })
+            }
+            Self::Return => {
+                let arg = arg.unwrap_or(ExpressionNode {
+                    expression: Expression::Atom(Atom::Literal(Literal::Nil)),
+                    span,
+                });
+                Ok(StatementNode {
+                    statement: Statement::Return(arg),
                     span,
                 })
             }

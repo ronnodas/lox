@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use thiserror::Error;
-
 use super::span::Span;
 use super::tokenizer::TokenKind;
 use super::{
@@ -11,10 +9,10 @@ use super::{
 };
 
 pub type Identifier = Arc<str>;
-pub type Str = Arc<str>;
 pub type LValue = Identifier;
 pub type Bp = u8;
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct StatementNode {
     pub statement: Statement,
     pub span: Span,
@@ -30,8 +28,11 @@ impl StatementNode {
             Statement::Expression(expression_node) => Statement::Print(expression_node),
             statement @ (Statement::Print(_)
             | Statement::Declaration(..)
+            | Statement::If(..)
             | Statement::While { .. }
-            | Statement::Block(_)) => statement,
+            | Statement::Block(_)
+            | Statement::FunctionDeclaration(..)
+            | Statement::Return(_)) => statement,
         };
         Self {
             statement,
@@ -40,18 +41,26 @@ impl StatementNode {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
     Expression(ExpressionNode),
     Print(ExpressionNode),
     Declaration(Identifier, Option<ExpressionNode>),
+    If(
+        ExpressionNode,
+        Box<StatementNode>,
+        Option<Box<StatementNode>>,
+    ),
     While {
         condition: ExpressionNode,
         body: Box<StatementNode>,
     },
     Block(Vec<StatementNode>),
+    FunctionDeclaration(Identifier, Vec<Identifier>, Box<StatementNode>),
+    Return(ExpressionNode),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExpressionNode {
     pub expression: Expression,
     pub span: Span,
@@ -63,7 +72,7 @@ impl ExpressionNode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Atom(Atom),
     Prefix(Prefix, Box<ExpressionNode>),
@@ -90,12 +99,13 @@ impl Expression {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Atom {
-    Value(Value),
+    Literal(Literal),
     Identifier(Identifier),
 }
+
 impl Atom {
     pub fn from_token(kind: TokenKind) -> Option<Self> {
-        Value::from_token(kind).map(Self::Value).or_else(|| {
+        Literal::from_token(kind).map(Self::Literal).or_else(|| {
             if let TokenKind::Identifier(identifier) = kind {
                 Some(Self::Identifier(identifier.into()))
             } else {
@@ -106,17 +116,17 @@ impl Atom {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Value {
+pub enum Literal {
     Number(f64),
-    String(Str),
+    String(String),
     Boolean(bool),
     Nil,
 }
 
-impl Value {
+impl Literal {
     #[expect(clippy::wildcard_enum_match_arm, reason = "noise")]
-    fn from_token(token: TokenKind) -> Option<Self> {
-        let value = match token {
+    pub(crate) fn from_token(token: TokenKind<'_>) -> Option<Self> {
+        let literal = match token {
             TokenKind::Number(number) => Self::Number(number),
             TokenKind::False => Self::Boolean(false),
             TokenKind::True => Self::Boolean(true),
@@ -124,10 +134,10 @@ impl Value {
             TokenKind::String(string) => Self::string(string),
             _ => return None,
         };
-        Some(value)
+        Some(literal)
     }
 
-    fn string(escaped: &str) -> Self {
+    pub(crate) fn string(escaped: &str) -> Self {
         let mut seen_slash = false;
         let string: String = escaped
             .chars()
@@ -143,24 +153,7 @@ impl Value {
                 c => Some(c),
             })
             .collect();
-
-        Self::String(string.into())
-    }
-
-    pub const fn float(&self) -> Option<f64> {
-        match self {
-            &Self::Number(number) => Some(number),
-            &Self::Boolean(boolean) => Some(if boolean { 1.0 } else { 0.0 }),
-            Self::String(_) | Self::Nil => None,
-        }
-    }
-
-    pub const fn is_truthy(&self) -> bool {
-        match self {
-            &Self::Boolean(boolean) => boolean,
-            Self::Nil => false,
-            Self::Number(_) | Self::String(_) => true,
-        }
+        Self::String(string)
     }
 }
 
@@ -198,16 +191,6 @@ pub enum Binary {
 }
 
 impl Binary {
-    pub fn evaluate(self, left: Value, right: Value) -> Result<Value, TypeError> {
-        match self {
-            Self::Field => todo!(),
-            Self::Arithmetic(op) => op.evaluate(left, right),
-            Self::Comparison(rel) => rel.evaluate(left, right).map(Value::Boolean),
-            Self::Equality(rel) => Ok(Value::Boolean(rel.evaluate(&left, &right))),
-            Self::Logical(op) => Ok(op.evaluate(left, right)),
-        }
-    }
-
     pub const fn binding_power(self) -> (u8, u8) {
         match self {
             Self::Field => INFIX_DOT_BINDING_POWER,
@@ -276,35 +259,6 @@ impl Arithmetic {
             Self::Times | Self::Divide => INFIX_PRODUCT_BINDING_POWER,
         }
     }
-
-    pub fn evaluate(self, left: Value, right: Value) -> Result<Value, TypeError> {
-        if self == Self::Plus {
-            match (&left, &right) {
-                (Value::String(left), Value::String(right)) => {
-                    return Ok(Value::String((left.as_ref().to_owned() + right).into()))
-                }
-                (Value::String(_), _) => return Err(TypeError::SumString(right)),
-                (_, Value::String(_)) => return Err(TypeError::SumString(left)),
-                _ => (),
-            }
-        }
-
-        let left = self.cast(left)?;
-        let right = self.cast(right)?;
-
-        let value = match self {
-            Self::Plus => left + right,
-            Self::Minus => left - right,
-            Self::Times => left * right,
-            Self::Divide => left / right,
-        };
-
-        Ok(Value::Number(value))
-    }
-
-    fn cast(self, value: Value) -> Result<f64, TypeError> {
-        value.float().ok_or(TypeError::Arithmetic(self, value))
-    }
 }
 
 impl Logical {
@@ -312,48 +266,6 @@ impl Logical {
         match self {
             Self::And => INFIX_AND_BINDING_POWER,
             Self::Or => INFIX_OR_BINDING_POWER,
-        }
-    }
-
-    pub fn evaluate(self, left: Value, right: Value) -> Value {
-        match (self, left.is_truthy()) {
-            (Self::And, false) | (Self::Or, true) => left,
-            (Self::And, true) | (Self::Or, false) => right,
-        }
-    }
-
-    pub const fn short_circuit(self, left: &Value) -> bool {
-        match self {
-            Self::And => !left.is_truthy(),
-            Self::Or => left.is_truthy(),
-        }
-    }
-}
-
-impl Comparison {
-    pub fn evaluate(self, left: Value, right: Value) -> Result<bool, TypeError> {
-        let left = self.cast(left)?;
-        let right = self.cast(right)?;
-
-        let value = match self {
-            Self::Greater => left > right,
-            Self::GreaterEqual => left >= right,
-            Self::Less => left < right,
-            Self::LessEqual => left <= right,
-        };
-        Ok(value)
-    }
-
-    fn cast(self, value: Value) -> Result<f64, TypeError> {
-        value.float().ok_or(TypeError::Comparison(self, value))
-    }
-}
-
-impl Equality {
-    pub fn evaluate(self, left: &Value, right: &Value) -> bool {
-        match self {
-            Self::Equal => left == right,
-            Self::NotEqual => left != right,
         }
     }
 }
@@ -415,11 +327,24 @@ pub trait StatementVisitor {
         identifier: &Identifier,
         initializer: Option<&ExpressionNode>,
     ) -> Result<Self::Output, Self::Error>;
+    fn visit_if(
+        &mut self,
+        condition: &ExpressionNode,
+        then_body: &StatementNode,
+        else_body: Option<&StatementNode>,
+    ) -> Result<Self::Output, Self::Error>;
     fn visit_while(
         &mut self,
         condition: &ExpressionNode,
         body: &StatementNode,
     ) -> Result<Self::Output, Self::Error>;
+    fn visit_function_declaration(
+        &mut self,
+        name: &Identifier,
+        args: &[Identifier],
+        body: &StatementNode,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_return(&mut self, expression: &ExpressionNode) -> Result<Self::Output, Self::Error>;
 
     fn visit(&mut self, node: &StatementNode) -> Result<Self::Output, Self::Error> {
         match &node.statement {
@@ -428,20 +353,15 @@ pub trait StatementVisitor {
             Statement::Declaration(identifier, initializer) => {
                 self.visit_declaration(identifier, initializer.as_ref())
             }
+            Statement::If(condition, then_body, else_body) => {
+                self.visit_if(condition, then_body, else_body.as_ref().map(Box::as_ref))
+            }
             Statement::While { condition, body } => self.visit_while(condition, body),
             Statement::Block(statements) => self.visit_block(statements),
+            Statement::FunctionDeclaration(name, args, body) => {
+                self.visit_function_declaration(name, args, body)
+            }
+            Statement::Return(expression) => self.visit_return(expression),
         }
     }
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum TypeError {
-    #[error("cannot compare {1} using {0}, not a number")]
-    Comparison(Comparison, Value),
-    #[error("cannot add {0} to a string")]
-    SumString(Value),
-    #[error("cannot apply {0} to {1}, not a number")]
-    Arithmetic(Arithmetic, Value),
-    #[error("cannot negate {0}")]
-    UnaryMinus(Value),
 }

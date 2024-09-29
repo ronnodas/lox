@@ -3,8 +3,8 @@ use std::fmt::{self, Display};
 use itertools::Itertools as _;
 
 use super::ast::{
-    Arithmetic, Atom, Binary, Comparison, Equality, ExpressionNode, ExpressionVisitor, Logical,
-    Prefix, Value,
+    Arithmetic, Atom, Binary, Comparison, Equality, ExpressionNode, ExpressionVisitor, Literal,
+    Logical, Prefix,
 };
 use super::Span;
 
@@ -17,7 +17,11 @@ impl<'a, 'f> ExpressionVisitor for Printer<'a, 'f> {
     type Error = fmt::Error;
 
     fn visit_atom(&mut self, atom: &Atom, _span: Span) -> Result<Self::Output, Self::Error> {
-        write!(self.formatter, "{atom}")
+        if let Atom::Literal(Literal::String(string)) = atom {
+            write!(self.formatter, "{string:?}")
+        } else {
+            write!(self.formatter, "{atom}")
+        }
     }
 
     fn visit_prefix(
@@ -65,7 +69,7 @@ impl Display for ExpressionNode {
     }
 }
 
-impl Display for Value {
+impl Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Number(number) => {
@@ -76,7 +80,7 @@ impl Display for Value {
                     write!(f, "{string}")
                 }
             }
-            Self::String(string) => write!(f, "{string:?}"),
+            Self::String(string) => write!(f, "{string}"),
             Self::Boolean(boolean) => write!(f, "{boolean}"),
             Self::Nil => write!(f, "nil"),
         }
@@ -86,7 +90,7 @@ impl Display for Value {
 impl Display for Atom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Value(value) => write!(f, "{value}"),
+            Self::Literal(value) => write!(f, "{value}"),
             Self::Identifier(identifier) => write!(f, "{identifier}"),
         }
     }
